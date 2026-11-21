@@ -662,6 +662,19 @@ class Inkling2Attention(nn.Module):
             k, v = kv.update_and_fetch(k, v)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
         row_ends = getattr(kv, "row_ends", None) if kv is not None else None
+        if (
+            not self.window
+            and q.shape[0] == 1
+            and q.shape[2] == 1
+            and k.shape[2] >= fused.LONG_ATTN_MIN_KEYS
+            and row_ends is None
+            and fused.enabled("longattn")
+        ):
+            # Full-attention decode over a long context: one KV read for the
+            # kv-head group at ~240 GB/s instead of SDPA's ~170.
+            return fused.long_decode_attention(
+                q, k, v, rel, sink, scale=self.scale, left_padding=left_padding
+            )
         shift = _ring_shift(kv, q.shape[2], k)
         if shift is not None:
             # A full rotating window after a one-token update: keys are in ring
