@@ -27,7 +27,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import kernels
+from . import fused, kernels
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -250,12 +250,13 @@ class ExpertProj(nn.Module):
             return None
         return self.global_scale[idx] * (1.0 / _NVFP4_DENOMINATOR)
 
-    def __call__(self, x, idx, sorted_indices):
+    def __call__(self, x, idx, sorted_indices, lhs=None):
         return mx.gather_qmm(
             x,
             self.weight,
             self.scales,
             self.get("biases"),
+            lhs_indices=lhs,
             rhs_indices=idx,
             transpose=True,
             group_size=self.group_size,
@@ -277,10 +278,22 @@ class Inkling2Experts(nn.Module):
         self.w2 = ExpertProj(e, h, i, w2_spec)
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+        self._gcap_f = float(args.mlp_gate_softcap)
+        self._ucap_f = float(args.mlp_up_softcap)
+
+    def _fused(self, xe, dtype, inds, weights):
+        y = self.w13(xe, inds, False)
+        g13 = self.w13.global_scale if self.w13.mode == "nvfp4" else None
+        act = fused.swiglu(y, inds, g13, 1.0 / _NVFP4_DENOMINATOR, self._gcap_f, self._ucap_f)
+        z = self.w2(act, inds, False)
+        g2 = self.w2.global_scale if self.w2.mode == "nvfp4" else None
+        return fused.combine(z, inds, weights, g2, 1.0 / _NVFP4_DENOMINATOR, dtype)
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
+        if not do_sort and fused.enabled("moe"):
+            return self._fused(xe, x.dtype, inds, weights)
         idx = inds
         inv = None
         if do_sort:
@@ -383,6 +396,13 @@ def _static_conv(x, w, state, scale):
     return out.astype(x.dtype), xp
 
 
+def _short_conv(x, w, state, scale):
+    """``_static_conv`` through the fused kernel for decode/verify inputs."""
+    if x.shape[1] <= fused.MAX_TOKENS and fused.enabled("conv"):
+        return fused.static_conv(x, w, state, scale)
+    return _static_conv(x, w, state, scale)
+
+
 def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     """Per-token taps ``static_w[lag] + dyn[head, lag]`` over k/v channels."""
     xf = x.astype(mx.float32)
@@ -445,6 +465,8 @@ class Inkling2Attention(nn.Module):
         self.rel_proj = mx.zeros((self.d_rel, self.rel_extent))
         self._qk_clip = mx.array(args.qk_l2_clip_threshold, dtype=mx.float32)
         self._r_clip = mx.array(args.rel_l2_clip_threshold, dtype=mx.float32)
+        self._qk_clip_f = float(args.qk_l2_clip_threshold)
+        self._r_clip_f = float(args.rel_l2_clip_threshold)
         self._one = mx.array(1.0, dtype=mx.float32)
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
@@ -479,8 +501,8 @@ class Inkling2Attention(nn.Module):
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
                 k = pk[..., self._cuts[0] : self._cuts[1]]
                 v = pv[..., self._cuts[1] : self._cuts[2]]
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+            k, ks = _short_conv(k, self.k_conv, ks, self._sconv_scale)
+            v, vs = _short_conv(v, self.v_conv, vs, self._sconv_scale)
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
@@ -501,6 +523,24 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
+        if length <= fused.MAX_TOKENS and fused.enabled("heads"):
+            q, k, v, r = fused.head_norms(
+                q,
+                k,
+                v,
+                r,
+                self.q_scale,
+                self.r_scale,
+                tau,
+                n_heads=self.n_heads,
+                n_kv=self.n_kv,
+                head_dim=self.head_dim,
+                d_rel=self.d_rel,
+                qk_clip=self._qk_clip_f,
+                r_clip=self._r_clip_f,
+            )
+            rel = r @ self.rel_proj.astype(r.dtype)
+            return q, k, v, rel, gate, sink, ks, vs
         q = _l2_clip(
             q.reshape(b, length, self.n_heads, self.head_dim),
             self.q_scale,
@@ -634,7 +674,7 @@ class Inkling2Layer(nn.Module):
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+        a, s2 = _short_conv(a, self.attn_conv, s2, self._conv_scale)
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -648,7 +688,7 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
+        m, s3 = _short_conv(m, self.mlp_conv, s3, self._conv_scale)
         return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
 
     def __call__(self, h, blocks, cache=None, bank=None):
@@ -684,8 +724,12 @@ class Inkling2Layer(nn.Module):
                 conv._omlx_verify_xp = dict(enumerate(windows))
             keep = self._conv_k - 1
             for slot, window in enumerate(windows):
-                # A small copy, so the state does not pin the chunk's window.
-                conv[slot] = window[:, -keep:] * 1.0
+                if length == 1 and fused.enabled("state"):
+                    # A one-token window is barely larger than the state.
+                    conv[slot] = window[:, -keep:]
+                else:
+                    # A small copy, so the state does not pin the chunk's window.
+                    conv[slot] = window[:, -keep:] * 1.0
         return h
 
 

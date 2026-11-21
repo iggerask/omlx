@@ -1,0 +1,335 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Fused Metal kernels for Inkling 2 decode and speculative verify.
+
+A decode step runs 48 layer visits and is bound by kernel launches, not by
+weight reads: the stock graph issues ~4,300 GPU kernels per token, most of
+them tiny elementwise, cast and reduction ops on [B, L, hidden] vectors.
+These kernels replace groups of them for short inputs (decode, verify and
+small batches, ``L <= MAX_TOKENS``); prefill keeps the stock code.
+
+- ``static_conv``: a depthwise causal short conv in one kernel (padded window,
+  taps, weight-dtype rounding, residual, scale) that also writes the padded
+  window the cache keeps.
+- ``head_norms``: the per-head L2 clips of q/k/r, the unit RMS of v and the
+  long-position query scaling in one kernel; q/k/v come out head-major.
+
+Set ``OMLX_INKLING2_FUSED=0`` to keep the stock path.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import mlx.core as mx
+
+MAX_TOKENS = 16
+_ONE = mx.ones((1,), dtype=mx.float32)
+
+
+def enabled(part: str = "") -> bool:
+    """``OMLX_INKLING2_FUSED=0`` turns every fusion off; ``..._OFF=moe,state``
+    turns off single parts."""
+    if os.environ.get("OMLX_INKLING2_FUSED", "1") == "0":
+        return False
+    return not part or part not in os.environ.get("OMLX_INKLING2_FUSED_OFF", "").split(",")
+
+
+# ---------------------------------------------------------------------------
+# Short convolution
+# ---------------------------------------------------------------------------
+
+_CONV_SOURCE = """
+    const uint c = thread_position_in_grid.x;
+    const uint b = thread_position_in_grid.y;
+    const int C = x_shape[2];
+    const int L = x_shape[1];
+    if ((int)c >= C) return;
+    constexpr int KM = K - 1;
+    float win[KM + MAXL];
+    for (int j = 0; j < KM; ++j) {
+        win[j] = state[b * state_strides[0] + j * state_strides[1] + c * state_strides[2]];
+    }
+    for (int t = 0; t < L; ++t) {
+        win[KM + t] = float(x[b * x_strides[0] + t * x_strides[1] + c * x_strides[2]]);
+    }
+    const int R = KM + L;
+    for (int r = 0; r < R; ++r) {
+        xp[(b * R + r) * C + c] = win[r];
+    }
+    float wf[K];
+    for (int j = 0; j < K; ++j) {
+        wf[j] = float(w[c * w_strides[0] + j * w_strides[1]]);
+    }
+    for (int t = 0; t < L; ++t) {
+        float acc = wf[0] * win[t];
+        for (int j = 1; j < K; ++j) {
+            acc = acc + wf[j] * win[t + j];
+        }
+        const float o = float(WT(acc));
+        out[(b * L + t) * C + c] = OT((o + win[KM + t]) * SCALE);
+    }
+"""
+_conv_kernels: dict = {}
+
+
+def static_conv(x: mx.array, w: mx.array, state: mx.array, scale: float):
+    """Fused ``model._static_conv``: returns ``(out, xp)`` with ``xp`` the FP32
+    padded window ``[state, x]``."""
+    b, length, c = x.shape
+    k = w.shape[-1]
+    key = (k, float(scale))
+    kern = _conv_kernels.get(key)
+    if kern is None:
+        src = _CONV_SOURCE.replace("SCALE", f"{float(scale)!r}f")
+        kern = _conv_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_static_conv_k{k}_{len(_conv_kernels)}",
+            input_names=["x", "state", "w"],
+            output_names=["out", "xp"],
+            source=src,
+            ensure_row_contiguous=False,
+        )
+    if state.dtype != mx.float32:
+        state = state.astype(mx.float32)
+    out, xp = kern(
+        inputs=[x, state, w],
+        template=[("K", k), ("MAXL", MAX_TOKENS), ("WT", w.dtype), ("OT", x.dtype)],
+        grid=(c, b, 1),
+        threadgroup=(min(256, c), 1, 1),
+        output_shapes=[(b, length, c), (b, k - 1 + length, c)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+    return out, xp
+
+
+# ---------------------------------------------------------------------------
+# Head norms: q/k/r L2 clips, v unit RMS, query/relative log scaling
+# ---------------------------------------------------------------------------
+
+# One simdgroup per (b, t, head) row of q, k, v or r. Rows are laid out
+# [q heads | k heads | v heads | r heads] for every (b, t).
+_HEADS_SOURCE = """
+    const uint row = threadgroup_position_in_grid.x;
+    const uint lane = thread_position_in_threadgroup.x;
+    const int L = q_shape[1];
+    constexpr int ROWS = HQ + 2 * HKV + HQ;
+    const int bt = row / ROWS;
+    const int j = row % ROWS;
+    const int b = bt / L;
+    const int t = bt % L;
+    const float tf = HAS_TAU ? tau[bt] : 1.0f;
+    if (j < HQ) {
+        // q: clip(x * q_scale), then * tau; written [B, HQ, L, D].
+        const int h = j;
+        float v[D / 32];
+        float ss = 0.0f;
+        for (int i = 0; i < D / 32; ++i) {
+            const int d = lane + 32 * i;
+            const float xv = float(q[b * q_strides[0] + t * q_strides[1] + (h * D + d) * q_strides[2]])
+                * float(q_scale[h * q_scale_strides[0] + d * q_scale_strides[1]]);
+            v[i] = xv;
+            ss += xv * xv;
+        }
+        ss = simd_sum(ss);
+        const float f = min(QK_CLIP / (sqrt(ss) + 1e-6f), 1.0f);
+        for (int i = 0; i < D / 32; ++i) {
+            const int d = lane + 32 * i;
+            T o = T(v[i] * f);
+            if (HAS_TAU) o = T(float(o) * tf);
+            qo[((b * HQ + h) * L + t) * D + d] = o;
+        }
+    } else if (j < HQ + HKV) {
+        // k: clip(x), written [B, HKV, L, D].
+        const int h = j - HQ;
+        float v[D / 32];
+        float ss = 0.0f;
+        for (int i = 0; i < D / 32; ++i) {
+            const int d = lane + 32 * i;
+            const float xv = float(k[b * k_strides[0] + t * k_strides[1] + (h * D + d) * k_strides[2]]);
+            v[i] = xv;
+            ss += xv * xv;
+        }
+        ss = simd_sum(ss);
+        const float f = min(QK_CLIP / (sqrt(ss) + 1e-6f), 1.0f);
+        for (int i = 0; i < D / 32; ++i) {
+            const int d = lane + 32 * i;
+            ko[((b * HKV + h) * L + t) * D + d] = T(v[i] * f);
+        }
+    } else if (j < HQ + 2 * HKV) {
+        // v: unit RMS in FP32, written [B, HKV, L, D].
+        const int h = j - HQ - HKV;
+        float v[D / 32];
+        float ss = 0.0f;
+        for (int i = 0; i < D / 32; ++i) {
+            const int d = lane + 32 * i;
+            const float xv = float(vv[b * vv_strides[0] + t * vv_strides[1] + (h * D + d) * vv_strides[2]]);
+            v[i] = xv;
+            ss += xv * xv;
+        }
+        ss = simd_sum(ss);
+        const float f = metal::precise::rsqrt(ss / float(D) + 1e-6f);
+        for (int i = 0; i < D / 32; ++i) {
+            const int d = lane + 32 * i;
+            vo[((b * HKV + h) * L + t) * D + d] = T(v[i] * f);
+        }
+    } else {
+        // r: clip(x * r_scale), then * tau; written [B, L, HQ, DR].
+        const int h = j - HQ - 2 * HKV;
+        float xv = 0.0f;
+        if (lane < DR) {
+            xv = float(r[b * r_strides[0] + t * r_strides[1] + (h * DR + lane) * r_strides[2]])
+                * float(r_scale[h * r_scale_strides[0] + lane * r_scale_strides[1]]);
+        }
+        const float ss = simd_sum(xv * xv);
+        const float f = min(R_CLIP / (sqrt(ss) + 1e-6f), 1.0f);
+        if (lane < DR) {
+            T o = T(xv * f);
+            if (HAS_TAU) o = T(float(o) * tf);
+            ro[((b * L + t) * HQ + h) * DR + lane] = o;
+        }
+    }
+"""
+_head_kernels: dict = {}
+
+
+def head_norms(q, k, v, r, q_scale, r_scale, tau, *, n_heads, n_kv, head_dim, d_rel, qk_clip, r_clip):
+    """Fused clips for ``Inkling2Attention.project``.
+
+    ``q``/``r``: [B, L, H*D] / [B, L, H*d_rel] (strided views are fine),
+    ``k``/``v``: [B, L, HKV*D]. ``tau``: [B, L, 1, 1] FP32 or None.
+    Returns q [B, H, L, D], k/v [B, HKV, L, D] and r [B, L, H, d_rel].
+    """
+    b, length, _ = q.shape
+    has_tau = tau is not None
+    key = (n_heads, n_kv, head_dim, d_rel, float(qk_clip), float(r_clip), has_tau, q.dtype)
+    kern = _head_kernels.get(key)
+    if kern is None:
+        src = _HEADS_SOURCE.replace("QK_CLIP", f"{float(qk_clip)!r}f").replace(
+            "R_CLIP", f"{float(r_clip)!r}f"
+        )
+        kern = _head_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_head_norms_{len(_head_kernels)}",
+            input_names=["q", "k", "vv", "r", "q_scale", "r_scale", "tau"],
+            output_names=["qo", "ko", "vo", "ro"],
+            source=src,
+            ensure_row_contiguous=False,
+        )
+    if tau is None:
+        tau_in = _ONE
+    else:
+        tau_in = mx.contiguous(mx.broadcast_to(tau.reshape(-1, length), (b, length)).astype(mx.float32))
+    rows = b * length * (2 * n_heads + 2 * n_kv)
+    dt = q.dtype
+    qo, ko, vo, ro = kern(
+        inputs=[q, k, v, r, q_scale, r_scale, tau_in],
+        template=[
+            ("T", dt),
+            ("HQ", n_heads),
+            ("HKV", n_kv),
+            ("D", head_dim),
+            ("DR", d_rel),
+            ("HAS_TAU", has_tau),
+        ],
+        grid=(32 * rows, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (b, n_heads, length, head_dim),
+            (b, n_kv, length, head_dim),
+            (b, n_kv, length, head_dim),
+            (b, length, n_heads, d_rel),
+        ],
+        output_dtypes=[dt, dt, dt, dt],
+    )
+    return qo, ko, vo, ro
+
+
+# ---------------------------------------------------------------------------
+# MoE: NVFP4 tensor scale + softcapped SwiGLU, and the weighted expert sum
+# ---------------------------------------------------------------------------
+
+# y: [N, K, 1, 2I] interleaved gate/up rows; act: [N, K, 1, I].
+_SWIGLU_SOURCE = """
+    const uint i = thread_position_in_grid.x;
+    const uint nk = thread_position_in_grid.y;
+    if ((int)i >= I) return;
+    const size_t base = (size_t)nk * (2 * I);
+    float g = float(y[base + 2 * i]);
+    float u = float(y[base + 2 * i + 1]);
+    if (HAS_SCALE) {
+        const T s = T(gscale[inds[nk]] * INV_DENOM);
+        g = float(T(g * float(s)));
+        u = float(T(u * float(s)));
+    }
+    const float o = metal::precise::tanh(g / GCAP) * GCAP * (1.0f / (1.0f + metal::precise::exp(-g)))
+        * (metal::precise::tanh(u / UCAP) * UCAP);
+    act[(size_t)nk * I + i] = T(o);
+"""
+
+# z: [N, K, 1, H]; out[n, h] = sum_k z * w[n, k] * (s[inds[n, k]] / denom).
+_COMBINE_SOURCE = """
+    const uint h = thread_position_in_grid.x;
+    const uint n = thread_position_in_grid.y;
+    if ((int)h >= H) return;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float w = weights[n * K + k];
+        if (HAS_SCALE) w = w * (gscale[inds[n * K + k]] * INV_DENOM);
+        acc += float(z[((size_t)n * K + k) * H + h]) * w;
+    }
+    out[(size_t)n * H + h] = OT(acc);
+"""
+_moe_kernels: dict = {}
+
+
+def _moe_kernel(name, source, inputs, outputs, consts):
+    key = (name, consts)
+    kern = _moe_kernels.get(key)
+    if kern is None:
+        src = source
+        for k, v in consts:
+            src = src.replace(k, f"{float(v)!r}f")
+        kern = _moe_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_{name}_{len(_moe_kernels)}",
+            input_names=inputs,
+            output_names=outputs,
+            source=src,
+        )
+    return kern
+
+
+def swiglu(y, inds, gscale, inv_denom, gcap, ucap):
+    """``y * (gscale[inds] * inv_denom)`` (BF16-rounded like the reference)
+    then the softcapped SwiGLU over interleaved gate/up columns."""
+    n, k, _, two_i = y.shape
+    i = two_i // 2
+    has = gscale is not None
+    kern = _moe_kernel(
+        "swiglu", _SWIGLU_SOURCE, ["y", "inds", "gscale"], ["act"],
+        (("INV_DENOM", inv_denom), ("GCAP", gcap), ("UCAP", ucap)),
+    )
+    return kern(
+        inputs=[y, inds, gscale if has else _ONE],
+        template=[("T", y.dtype), ("I", i), ("HAS_SCALE", has)],
+        grid=(i, n * k, 1),
+        threadgroup=(min(256, i), 1, 1),
+        output_shapes=[(n, k, 1, i)],
+        output_dtypes=[y.dtype],
+    )[0]
+
+
+def combine(z, inds, weights, gscale, inv_denom, out_dtype):
+    """Weighted sum over the top-k expert outputs with the NVFP4 tensor scale."""
+    n, k, _, h = z.shape
+    has = gscale is not None
+    kern = _moe_kernel(
+        "combine", _COMBINE_SOURCE, ["z", "inds", "weights", "gscale"], ["out"],
+        (("INV_DENOM", inv_denom),),
+    )
+    return kern(
+        inputs=[z, inds, weights, gscale if has else _ONE],
+        template=[("OT", out_dtype), ("H", h), ("K", k), ("HAS_SCALE", has)],
+        grid=(h, n, 1),
+        threadgroup=(min(256, h), 1, 1),
+        output_shapes=[(n, h)],
+        output_dtypes=[out_dtype],
+    )[0]
