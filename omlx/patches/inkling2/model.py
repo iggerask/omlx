@@ -370,8 +370,11 @@ class AttnResQuery(nn.Module):
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
 
 
-def _mix_messages(x, message, down, gain_forget):
+def _mix_messages(x, message, down, gain_forget, small=None):
     if x.shape[1] * x.shape[2] <= fused.MAX_TOKENS and fused.enabled("msg"):
+        if small is not None and fused.enabled("bf16w"):
+            # Exact BF16 copies of the FP32 gate weights: half the reads.
+            down, gain_forget = small
         return fused.mix_messages(x, message, down, gain_forget)
     if fused.enabled("msglong"):
         return fused.mix_messages_long(x, message, down, gain_forget)
@@ -750,7 +753,68 @@ class Inkling2Layer(nn.Module):
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
+    def _loop_bf16(self):
+        """BF16 copies of the loop gate weights (their FP32 values are all
+        BF16-representable), built once outside compiled traces."""
+        cached = self.__dict__.get("_loop_bf16_w")
+        if cached is None:
+            cached = (
+                self.loop_down.astype(mx.bfloat16),
+                self.loop_gain_forget.astype(mx.bfloat16),
+            )
+            mx.eval(cached)
+            self.__dict__["_loop_bf16_w"] = cached
+        return cached
+
+    def _loop_small(self, rows):
+        cached = self.__dict__.get("_loop_bf16_w")
+        return None if cached is None else (cached[0][rows], cached[1][rows])
+
+    def _norm_weights(self):
+        """Stacked [Q, H] RMSNorm weights of the attention inputs, built once
+        (outside compiled traces)."""
+        cached = self.__dict__.get("_norm_w")
+        if cached is None:
+            if self.sliding:
+                cached = mx.stack([self.attn_norm.weight] * 3)
+            else:
+                cached = mx.stack(
+                    [self.q_input_norm.weight, self.k_input_norm.weight, self.v_input_norm.weight]
+                )
+            mx.eval(cached)
+            self.__dict__["_norm_w"] = cached
+        return cached
+
+    def _pre_fused(self, h, blocks, ks, vs, tau, messages):
+        nw = self._norm_weights()
+        eps = self.mlp_norm.eps
+        query, scale = self.attn_input.query, self.attn_input.scale
+        if messages is None:
+            q_rows = 1 if self.sliding else 3
+            h_n, mixed = fused.res_mix(blocks, h, query, scale, norm_w=nw[:q_rows], eps=eps)
+            if self.sliding:
+                xq, xk, xv = mixed[:, :, 0], None, None
+            else:
+                xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
+        else:
+            h_n, mixed = fused.res_mix(blocks, h, query, scale)
+            if self.sliding:
+                x3 = mx.stack([mixed[:, :, 0]] * 3)
+            else:
+                x3 = mixed.transpose(2, 0, 1, 3)
+            x3 = _mix_messages(
+                x3,
+                messages[:, :, :3].transpose(2, 0, 1, 3),
+                self.loop_down[:3],
+                self.loop_gain_forget[:3],
+                small=self._loop_small(slice(0, 3)),
+            )
+            xq, xk, xv = fused.multi_norm(x3, nw, eps)
+        return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
+
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
+        if self.layer_idx > 0 and h.shape[1] <= fused.MAX_TOKENS and fused.enabled("resmix"):
+            return self._pre_fused(h, blocks, ks, vs, tau, messages)
         dtype = h.dtype
         h_n = _unit_rms(h.astype(mx.float32))
         if self.layer_idx == 0:
@@ -767,6 +831,7 @@ class Inkling2Layer(nn.Module):
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 self.loop_down[:3],
                 self.loop_gain_forget[:3],
+                small=self._loop_small(slice(0, 3)),
             )
         if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
@@ -782,6 +847,22 @@ class Inkling2Layer(nn.Module):
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
         a, s2 = _short_conv(a, self.attn_conv, s2, self._conv_scale)
+        if h.shape[1] <= fused.MAX_TOKENS and fused.enabled("resmix"):
+            nw = self.mlp_norm.weight[None] if messages is None else None
+            residual, y = fused.res_mix(
+                mlp_blocks, h, self.mlp_input.query, self.mlp_input.scale,
+                a=a, boundary=self.is_boundary, norm_w=nw, eps=self.mlp_norm.eps,
+            )
+            y = y[:, :, 0]
+            if messages is not None:
+                y = _mix_messages(
+                    y[None], messages[None, :, :, 3], self.loop_down[3:], self.loop_gain_forget[3:],
+                    small=self._loop_small(slice(3, 4)),
+                )
+                y = fused.multi_norm(y, self.mlp_norm.weight[None], self.mlp_norm.eps)[0]
+            m = self.mlp(y)
+            m, s3 = _short_conv(m, self.mlp_conv, s3, self._conv_scale)
+            return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -793,6 +874,7 @@ class Inkling2Layer(nn.Module):
                 messages[None, :, :, 3],
                 self.loop_down[3:],
                 self.loop_gain_forget[3:],
+                small=self._loop_small(slice(3, 4)),
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
         m, s3 = _short_conv(m, self.mlp_conv, s3, self._conv_scale)
@@ -821,6 +903,10 @@ class Inkling2Layer(nn.Module):
             self.attn._row_projections()
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
+        if compiled and self.layer_idx > 0 and fused.enabled("resmix"):
+            self._norm_weights()  # outside the trace
+        if compiled and bank is not None:
+            self._loop_bf16()
         messages = self.loop_message(*bank) if bank is not None else None
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
             h, blocks, states[0], states[1], tau, messages

@@ -456,15 +456,15 @@ _MSG_DOWN_SOURCE = """
     for (int i = 0; i < RANK / 32; ++i) { tx += red[i]; tm += red[RANK / 32 + i]; }
     const float fx = metal::precise::rsqrt(tx / float(H) + 1e-6f);
     const float fm = metal::precise::rsqrt(tm / float(H) + 1e-6f);
-    const device float* d0 = down + (size_t)n * 2 * H * RANK;
-    const device float* d1 = d0 + (size_t)H * RANK;
+    const device WT* d0 = down + (size_t)n * 2 * H * RANK;
+    const device WT* d1 = d0 + (size_t)H * RANK;
     float acc0 = 0.0f, acc1 = 0.0f;
     const int i0 = g * CH;
     for (int i = i0; i < i0 + CH; ++i) {
         const float zx = float(bfloat16_t(xr[i] * fx));
         const float zm = float(bfloat16_t(mr[i] * fm));
-        acc0 += zx * d0[(size_t)i * RANK + tid];
-        acc1 += zm * d1[(size_t)i * RANK + tid];
+        acc0 += zx * float(d0[(size_t)i * RANK + tid]);
+        acc1 += zm * float(d1[(size_t)i * RANK + tid]);
     }
     part[((size_t)nr * G + g) * RANK + tid] = acc0;
     part[(((size_t)NR + nr) * G + g) * RANK + tid] = acc1;
@@ -488,12 +488,12 @@ _MSG_UP_SOURCE = """
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if ((int)h >= H) return;
-    const device float* gf = gain_forget + (size_t)n * RANK * 2 * H;
+    const device WT* gf = gain_forget + (size_t)n * RANK * 2 * H;
     float ga = 0.0f, fo = 0.0f;
     for (int k = 0; k < RANK; ++k) {
         const float l = lr[k];
-        ga += l * gf[(size_t)k * 2 * H + h];
-        fo += l * gf[(size_t)k * 2 * H + H + h];
+        ga += l * float(gf[(size_t)k * 2 * H + h]);
+        fo += l * float(gf[(size_t)k * 2 * H + H + h]);
     }
     const float gain = metal::precise::tanh(ga);
     const float forget = metal::precise::tanh(fo);
@@ -511,7 +511,7 @@ def mix_messages(x, message, down, gain_forget):
     rank = down.shape[-1]
     ch = _MSG_CHUNK if hidden % _MSG_CHUNK == 0 else 1
     groups = hidden // ch
-    key = (hidden, rank, rows, n)
+    key = (hidden, rank, rows, n, down.dtype)
     kerns = _msg_kernels.get(key)
     if kerns is None:
         kerns = _msg_kernels[key] = (
@@ -533,7 +533,8 @@ def mix_messages(x, message, down, gain_forget):
     nr = n * rows
     part = kerns[0](
         inputs=[x, message, down],
-        template=[("H", hidden), ("RANK", rank), ("ROWS", rows), ("CH", ch), ("G", groups), ("NR", nr)],
+        template=[("H", hidden), ("RANK", rank), ("ROWS", rows), ("CH", ch), ("G", groups), ("NR", nr),
+                  ("WT", down.dtype)],
         grid=(rank * groups, nr, 1),
         threadgroup=(rank, 1, 1),
         output_shapes=[(2, nr, groups, rank)],
@@ -541,7 +542,8 @@ def mix_messages(x, message, down, gain_forget):
     )[0]
     return kerns[1](
         inputs=[part, gain_forget, x, message],
-        template=[("H", hidden), ("RANK", rank), ("ROWS", rows), ("G", groups), ("NR", nr)],
+        template=[("H", hidden), ("RANK", rank), ("ROWS", rows), ("G", groups), ("NR", nr),
+                  ("WT", gain_forget.dtype)],
         grid=(hidden, nr, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[x.shape],
@@ -915,3 +917,228 @@ def static_conv_long(x, w, state, scale):
 
 def dynamic_conv_long(x, dyn, static_w, state, heads, scale):
     return _conv_long(x, static_w, state, scale, dyn=dyn, heads=heads)
+
+
+# ---------------------------------------------------------------------------
+# Depth mixing with its neighbours (decode/verify rows): residual add, unit
+# RMS of the partial sum, softmax over depth sources, and the RMSNorm + BF16
+# cast of each mixed input, in one kernel per token row.
+# ---------------------------------------------------------------------------
+
+_RM_TG = 256
+_res_mix_kernels: dict = {}
+
+
+def _res_mix_kernel(blocks: int, queries: int, add: bool, norm: bool, hidden: int, eps: float):
+    key = (blocks, queries, add, norm, hidden, eps)
+    kern = _res_mix_kernels.get(key)
+    if kern is not None:
+        return kern
+    per = (hidden + _RM_TG - 1) // _RM_TG
+    srcs = [f"b{i}" for i in range(blocks)]
+    ns = blocks + 1
+    loads = "\n".join(f"            sv[{i}] = {n}[base + h];" for i, n in enumerate(srcs))
+    source = f"""
+    constexpr uint NS = {ns};
+    constexpr uint PER = {per};
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    size_t base = (size_t)row * H;
+    threadgroup float red[NS * Q > Q ? NS * Q : Q][TG / 32];
+    // 1. the partial sum and its unit RMS
+    float pv[PER];
+    float ss = 0.0f;
+    for (uint j = 0; j < PER; ++j) {{
+        uint h = tid + j * TG;
+        float r = 0.0f;
+        if (h < H) {{
+            r = float(x[base + h]);
+            if (ADD) r = (BOUNDARY ? 0.0f : r) + float(a[base + h]);
+            keep_r[base + h] = r;
+        }}
+        pv[j] = r;
+        ss += r * r;
+    }}
+    {{
+        float v = simd_sum(ss);
+        if (lane == 0) red[0][sg] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float t = 0.0f;
+        for (uint j = 0; j < TG / 32; ++j) t += red[0][j];
+        float inv = metal::precise::rsqrt(t / float(H) + 1e-6f);
+        for (uint j = 0; j < PER; ++j) {{
+            pv[j] = pv[j] * inv;
+            uint h = tid + j * TG;
+            if (!ADD && h < H) keep_r[base + h] = pv[j];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    // 2. logits of every source against every query
+    float acc[NS * Q];
+    for (uint i = 0; i < NS * Q; ++i) acc[i] = 0.0f;
+    for (uint j = 0; j < PER; ++j) {{
+        uint h = tid + j * TG;
+        if (h >= H) break;
+        float sv[NS];
+{loads}
+        sv[NS - 1] = pv[j];
+        for (uint qi = 0; qi < Q; ++qi) {{
+            float qv = query[qi * H + h];
+            for (uint n = 0; n < NS; ++n) acc[n * Q + qi] += sv[n] * qv;
+        }}
+    }}
+    for (uint i = 0; i < NS * Q; ++i) {{
+        float v = simd_sum(acc[i]);
+        if (lane == 0) red[i][sg] = v;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float w[NS * Q];
+    for (uint i = 0; i < NS * Q; ++i) {{
+        float t = 0.0f;
+        for (uint j = 0; j < TG / 32; ++j) t += red[i][j];
+        w[i] = t * scale[0];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint qi = 0; qi < Q; ++qi) {{
+        float m = -INFINITY;
+        for (uint n = 0; n < NS; ++n) m = max(m, w[n * Q + qi]);
+        float z = 0.0f;
+        for (uint n = 0; n < NS; ++n) {{
+            w[n * Q + qi] = metal::exp(w[n * Q + qi] - m);
+            z += w[n * Q + qi];
+        }}
+        for (uint n = 0; n < NS; ++n) w[n * Q + qi] /= z;
+    }}
+    // 3. the mixtures, then (NORM) RMSNorm with the query's weight and BF16
+    float mv[Q][PER];
+    float sq[Q];
+    for (uint qi = 0; qi < Q; ++qi) sq[qi] = 0.0f;
+    for (uint j = 0; j < PER; ++j) {{
+        uint h = tid + j * TG;
+        float sv[NS];
+        if (h < H) {{
+{loads}
+        }} else {{
+            for (uint n = 0; n + 1 < NS; ++n) sv[n] = 0.0f;
+        }}
+        sv[NS - 1] = pv[j];
+        for (uint qi = 0; qi < Q; ++qi) {{
+            float o = 0.0f;
+            for (uint n = 0; n < NS; ++n) o = n == 0 ? w[qi] * sv[0] : o + w[n * Q + qi] * sv[n];
+            mv[qi][j] = o;
+            sq[qi] += o * o;
+        }}
+    }}
+    if (NORM) {{
+        for (uint qi = 0; qi < Q; ++qi) {{
+            float v = simd_sum(sq[qi]);
+            if (lane == 0) red[qi][sg] = v;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint qi = 0; qi < Q; ++qi) {{
+            float t = 0.0f;
+            for (uint j = 0; j < TG / 32; ++j) t += red[qi][j];
+            float inv = metal::precise::rsqrt(t / float(H) + EPS);
+            for (uint j = 0; j < PER; ++j) {{
+                uint h = tid + j * TG;
+                if (h < H) out[((size_t)row * Q + qi) * H + h] =
+                    OT(float(nw[qi * H + h]) * (mv[qi][j] * inv));
+            }}
+        }}
+    }} else {{
+        for (uint qi = 0; qi < Q; ++qi)
+            for (uint j = 0; j < PER; ++j) {{
+                uint h = tid + j * TG;
+                if (h < H) out[((size_t)row * Q + qi) * H + h] = OT(mv[qi][j]);
+            }}
+    }}
+"""
+    source = source.replace("EPS", f"{float(eps)!r}f")
+    kern = _res_mix_kernels[key] = mx.fast.metal_kernel(
+        name=f"inkling2_res_mix_{len(_res_mix_kernels)}",
+        input_names=[*srcs, "x", "a", "query", "nw", "scale"],
+        output_names=["keep_r", "out"],
+        source=source,
+    )
+    return kern
+
+
+def res_mix(blocks, x, query, scale, *, a=None, boundary=False, norm_w=None, eps=1e-6):
+    """Depth mixing of decode/verify rows with its neighbours fused.
+
+    ``x`` [B, L, H]: the partial sum (pre-attention ``h``), or with ``a`` the
+    residual input ``h + a`` (``a`` alone at a block boundary). Returns
+    ``(keep, mixed)``: ``keep`` is the FP32 unit-RMS partial (without ``a``)
+    or the FP32 residual (with ``a``); ``mixed`` is [B, L, Q, H], BF16 after
+    RMSNorm with ``norm_w`` [Q, H] rows, or FP32 without ``norm_w``.
+    """
+    b, length, hidden = x.shape
+    nq = query.shape[0]
+    add = a is not None
+    norm = norm_w is not None
+    kern = _res_mix_kernel(len(blocks), nq, add, norm, hidden, float(eps))
+    outs = kern(
+        inputs=[*[s.astype(mx.float32) for s in blocks], x, a if add else x,
+                query.astype(mx.float32), norm_w if norm else _ONE, mx.array([scale], dtype=mx.float32)],
+        template=[("H", hidden), ("Q", nq), ("TG", _RM_TG), ("ADD", add), ("BOUNDARY", bool(boundary)),
+                  ("NORM", norm), ("OT", mx.bfloat16 if norm else mx.float32)],
+        grid=(b * length * _RM_TG, 1, 1),
+        threadgroup=(_RM_TG, 1, 1),
+        output_shapes=[(b, length, hidden), (b, length, nq, hidden)],
+        output_dtypes=[mx.float32, mx.bfloat16 if norm else mx.float32],
+    )
+    return outs[0], outs[1]
+
+
+_MULTI_NORM_SOURCE = """
+    constexpr uint PER = (H + TG - 1) / TG;
+    uint row = threadgroup_position_in_grid.x;   // n * rows + r
+    uint n = row / ROWS;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    size_t base = (size_t)row * H;
+    threadgroup float red[TG / 32];
+    float v[PER];
+    float ss = 0.0f;
+    for (uint j = 0; j < PER; ++j) {
+        uint h = tid + j * TG;
+        v[j] = h < H ? float(x[base + h]) : 0.0f;
+        ss += v[j] * v[j];
+    }
+    float s = simd_sum(ss);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float t = 0.0f;
+    for (uint j = 0; j < TG / 32; ++j) t += red[j];
+    float inv = metal::precise::rsqrt(t / float(H) + EPS);
+    for (uint j = 0; j < PER; ++j) {
+        uint h = tid + j * TG;
+        if (h < H) out[base + h] = bfloat16_t(float(w[n * H + h]) * (v[j] * inv));
+    }
+"""
+_multi_norm_kernels: dict = {}
+
+
+def multi_norm(x, w, eps):
+    """RMSNorm of ``x[n]`` [N, B, L, H] with weight ``w[n]`` [N, H], cast to BF16."""
+    n, b, length, hidden = x.shape
+    key = float(eps)
+    kern = _multi_norm_kernels.get(key)
+    if kern is None:
+        kern = _multi_norm_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_multi_norm_{len(_multi_norm_kernels)}",
+            input_names=["x", "w"],
+            output_names=["out"],
+            source=_MULTI_NORM_SOURCE.replace("EPS", f"{float(eps)!r}f"),
+        )
+    return kern(
+        inputs=[x, w],
+        template=[("H", hidden), ("TG", _RM_TG), ("ROWS", b * length)],
+        grid=(n * b * length * _RM_TG, 1, 1),
+        threadgroup=(_RM_TG, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.bfloat16],
+    )[0]
