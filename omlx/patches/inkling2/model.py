@@ -766,7 +766,7 @@ _COMPILED_MAX_TOKENS = 16
 # Prefill chunk lengths that also run compiled: the scheduler's chunk size, so
 # every chunk but a prompt's last reuses one trace per layer.
 _COMPILED_PREFILL_LENGTHS = frozenset(
-    int(n) for n in os.environ.get("OMLX_INKLING2_COMPILED_PREFILL", "2048").split(",") if n
+    int(n) for n in os.environ.get("OMLX_INKLING2_COMPILED_PREFILL", "2048,1024").split(",") if n
 )
 
 

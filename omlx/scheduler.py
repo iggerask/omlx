@@ -3335,6 +3335,25 @@ class Scheduler:
     # NAX hosts with at least 128 GB; other large hosts keep 4096.
     _MIMO_NAX_PREFILL_FLOOR = 8192
 
+    def _is_inkling2(self) -> bool:
+        """Inkling 2 (looped MoE, window-sized rotating KV on sliding layers).
+
+        Its MoE prefill runs measurably faster in 2048-token chunks than in
+        1024 (8k prompt: 1334 vs 1275 tok/s), and chunks are clamped to the
+        block size, so it takes the 2048 block like the pooling models.
+        """
+        from .patches.inkling2 import INKLING2_MODEL_TYPES
+
+        for target in (self.model, getattr(self.model, "model", None)):
+            if target is None:
+                continue
+            mt = str(getattr(target, "model_type", "") or "")
+            if not mt:
+                mt = str(getattr(getattr(target, "config", None), "model_type", "") or "")
+            if mt in INKLING2_MODEL_TYPES or type(target).__module__.startswith("omlx.patches.inkling2"):
+                return True
+        return False
+
     def _is_mimo_hybrid(self) -> bool:
         """MiMo hybrid MoE (standard softmax attn + rotating KV).
 
@@ -3388,7 +3407,7 @@ class Scheduler:
         # If window_size itself is already >= max, just use window_size.
         lo = self._ROTATING_BLOCK_SIZE_MIN
         hi = self._ROTATING_BLOCK_SIZE_MAX
-        if self._detect_pooling_cache() or self._is_mimo_hybrid():
+        if self._detect_pooling_cache() or self._is_mimo_hybrid() or self._is_inkling2():
             # MiMo hybrid MoE: skewed top-8 routing leaves ~10 rows
             # per expert at a 512-token chunk, so the gather_qmm BM
             # tiles mostly compute padding; a 2048-token chunk fills
