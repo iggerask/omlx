@@ -5,7 +5,11 @@ A decode step runs 48 layer visits and is bound by kernel launches, not by
 weight reads: the stock graph issues ~4,300 GPU kernels per token, most of
 them tiny elementwise, cast and reduction ops on [B, L, hidden] vectors.
 These kernels replace groups of them for short inputs (decode, verify and
-small batches, ``L <= MAX_TOKENS``); prefill keeps the stock code.
+small batches, ``L <= MAX_TOKENS``). Prefill (longer inputs) uses the
+long variants: ``static_conv_long`` / ``dynamic_conv_long`` (one thread per
+channel and token), ``head_norms`` at any length (part ``headslong``), the
+SwiGLU and expert-sum kernels around the sorted expert matmuls (``moelong``)
+and ``mix_messages_long`` (``msglong``).
 
 - ``static_conv``: a depthwise causal short conv in one kernel (padded window,
   taps, weight-dtype rounding, residual, scale) that also writes the padded
@@ -13,7 +17,9 @@ small batches, ``L <= MAX_TOKENS``); prefill keeps the stock code.
 - ``head_norms``: the per-head L2 clips of q/k/r, the unit RMS of v and the
   long-position query scaling in one kernel; q/k/v come out head-major.
 
-Set ``OMLX_INKLING2_FUSED=0`` to keep the stock path.
+Set ``OMLX_INKLING2_FUSED=0`` to keep the stock path, or list parts in
+``OMLX_INKLING2_FUSED_OFF`` (conv, dconv, convlong, heads, headslong, moe,
+moelong, state, msg, msglong, attn, rows).
 """
 
 from __future__ import annotations
@@ -823,3 +829,84 @@ def mix_messages_long(x, message, down, gain_forget):
         output_shapes=[x.shape],
         output_dtypes=[mx.float32],
     )[0]
+
+
+# ---------------------------------------------------------------------------
+# Short convs for long inputs (prefill): one thread per (channel, token)
+# ---------------------------------------------------------------------------
+
+_CONV_LONG_SOURCE = """
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const int C = x_shape[2];
+    const int L = x_shape[1];
+    if ((int)c >= C || (int)t >= L) return;
+    constexpr int KM = K - 1;
+    const int R = KM + L;
+    const float xt = float(x[b * x_strides[0] + t * x_strides[1] + c * x_strides[2]]);
+    xp[((size_t)b * R + KM + t) * C + c] = xt;
+    if ((int)t < KM) {
+        xp[((size_t)b * R + t) * C + c] = state[b * state_strides[0] + t * state_strides[1] + c * state_strides[2]];
+    }
+    // window element j of token t: padded index t + j (j = 0 is the oldest tap).
+    float win[K];
+    for (int j = 0; j < K; ++j) {
+        const int pi = (int)t + j;
+        win[j] = pi < KM
+            ? state[b * state_strides[0] + pi * state_strides[1] + c * state_strides[2]]
+            : float(x[b * x_strides[0] + (pi - KM) * x_strides[1] + c * x_strides[2]]);
+    }
+    float acc;
+    if (DYN) {
+        const int head = c / (C / HEADS);
+        acc = 0.0f;
+        for (int lag = 0; lag < K; ++lag) {
+            const float tap = float(w[lag * w_strides[0] + c * w_strides[1]])
+                + float(dyn[b * dyn_strides[0] + t * dyn_strides[1] + (head * K + lag) * dyn_strides[2]]);
+            const float term = win[KM - lag] * tap;
+            acc = lag == 0 ? term : acc + term;
+        }
+        out[((size_t)b * L + t) * C + c] = OT((acc + xt) * SCALE);
+    } else {
+        acc = float(w[c * w_strides[0]]) * win[0];
+        for (int j = 1; j < K; ++j) acc = acc + float(w[c * w_strides[0] + j * w_strides[1]]) * win[j];
+        const float o = float(WT(acc));
+        out[((size_t)b * L + t) * C + c] = OT((o + xt) * SCALE);
+    }
+"""
+_conv_long_kernels: dict = {}
+
+
+def _conv_long(x, w, state, scale, dyn=None, heads=1):
+    b, length, c = x.shape
+    k = w.shape[-1] if dyn is None else w.shape[0]
+    is_dyn = dyn is not None
+    key = (k, float(scale), is_dyn, heads)
+    kern = _conv_long_kernels.get(key)
+    if kern is None:
+        kern = _conv_long_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_conv_long_{len(_conv_long_kernels)}",
+            input_names=["x", "state", "w", "dyn"],
+            output_names=["out", "xp"],
+            source=_CONV_LONG_SOURCE.replace("SCALE", f"{float(scale)!r}f"),
+            ensure_row_contiguous=False,
+        )
+    if state.dtype != mx.float32:
+        state = state.astype(mx.float32)
+    return kern(
+        inputs=[x, state, w, dyn if is_dyn else x],
+        template=[("K", k), ("DYN", is_dyn), ("HEADS", heads), ("WT", w.dtype), ("OT", x.dtype)],
+        grid=(c, length, b),
+        threadgroup=(min(256, c), 1, 1),
+        output_shapes=[(b, length, c), (b, k - 1 + length, c)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+
+
+def static_conv_long(x, w, state, scale):
+    return _conv_long(x, w, state, scale)
+
+
+def dynamic_conv_long(x, dyn, static_w, state, heads, scale):
+    return _conv_long(x, static_w, state, scale, dyn=dyn, heads=heads)

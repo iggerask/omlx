@@ -281,6 +281,17 @@ class Inkling2Experts(nn.Module):
         self._gcap_f = float(args.mlp_gate_softcap)
         self._ucap_f = float(args.mlp_up_softcap)
 
+    def _fused_sorted(self, xe, dtype, inds, weights):
+        xs, idx, inv = _gather_sort(xe, inds)
+        y = self.w13(xs, idx, True)
+        g13 = self.w13.global_scale if self.w13.mode == "nvfp4" else None
+        y4 = y.reshape(-1, 1, 1, y.shape[-1])
+        act = fused.swiglu(y4, idx, g13, 1.0 / _NVFP4_DENOMINATOR, self._gcap_f, self._ucap_f)
+        z = self.w2(act.reshape(y.shape[:-1] + (act.shape[-1],)), idx, True)
+        z = _scatter_unsort(z, inv, inds.shape)
+        g2 = self.w2.global_scale if self.w2.mode == "nvfp4" else None
+        return fused.combine(z, inds, weights, g2, 1.0 / _NVFP4_DENOMINATOR, dtype)
+
     def _fused(self, xe, dtype, inds, weights):
         y = self.w13(xe, inds, False)
         g13 = self.w13.global_scale if self.w13.mode == "nvfp4" else None
@@ -296,6 +307,8 @@ class Inkling2Experts(nn.Module):
             return self._fused(xe, x.dtype, inds, weights)
         idx = inds
         inv = None
+        if do_sort and fused.enabled("moelong"):
+            return self._fused_sorted(xe, x.dtype, inds, weights)
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
@@ -408,12 +421,16 @@ def _short_conv(x, w, state, scale):
     """``_static_conv`` through the fused kernel for decode/verify inputs."""
     if x.shape[1] <= fused.MAX_TOKENS and fused.enabled("conv"):
         return fused.static_conv(x, w, state, scale)
+    if fused.enabled("convlong"):
+        return fused.static_conv_long(x, w, state, scale)
     return _static_conv(x, w, state, scale)
 
 
 def _dyn_conv(x, dyn, static_w, state, heads, scale):
     if x.shape[1] <= fused.MAX_TOKENS and fused.enabled("dconv"):
         return fused.dynamic_conv(x, dyn, static_w, state, heads, scale)
+    if fused.enabled("convlong"):
+        return fused.dynamic_conv_long(x, dyn, static_w, state, heads, scale)
     return _dynamic_conv(x, dyn, static_w, state, heads, scale)
 
 
@@ -566,7 +583,7 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
-        if length <= fused.MAX_TOKENS and fused.enabled("heads"):
+        if fused.enabled("heads") and (length <= fused.MAX_TOKENS or fused.enabled("headslong")):
             q, k, v, r = fused.head_norms(
                 q,
                 k,
