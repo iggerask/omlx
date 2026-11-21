@@ -665,7 +665,7 @@ class Inkling2Attention(nn.Module):
         if (
             not self.window
             and q.shape[0] == 1
-            and q.shape[2] == 1
+            and q.shape[2] <= fused.LONG_ATTN_MAX_QUERIES
             and k.shape[2] >= fused.LONG_ATTN_MIN_KEYS
             and row_ends is None
             and fused.enabled("longattn")

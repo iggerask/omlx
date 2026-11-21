@@ -1327,110 +1327,105 @@ def nvfp4_down_sum(act, proj, inds, weights, inv_denom, out_dtype):
 # ---------------------------------------------------------------------------
 
 _LONG_ATTN_SOURCE = """
+    // grid: (32 * NSG, NSPLIT / NSG, HKV). Each simdgroup owns one key split and
+    // writes its own partial for the ROWS = GROUP * L query rows of its kv head.
     constexpr float LOG2E = 1.4426950408889634f;
+    constexpr int ROWS = GROUP * L;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
-    const uint split = threadgroup_position_in_grid.y;
+    const uint split = threadgroup_position_in_grid.y * NSG + sg;
     const uint hk = threadgroup_position_in_grid.z;
     const int S = k_shape[2];
     const int chunk = dims[0];
     const int lp = dims[1];   // left padding of the row: keys before it are not real
     const float qscale = scale[0] * LOG2E;
-    threadgroup float4 qs[GROUP][D / 4];
-    for (uint i = tid; i < GROUP * D / 4; i += 32 * NSG) {
-        const uint g = i / (D / 4), c = i % (D / 4);
-        const device T* qp = q + (hk * GROUP + g) * q_strides[1] + (c * 4) * q_strides[3];
-        qs[g][c] = float4(float(qp[0]), float(qp[q_strides[3]]), float(qp[2 * q_strides[3]]), float(qp[3 * q_strides[3]])) * qscale;
+    threadgroup float4 qs[ROWS][D / 4];
+    for (uint i = tid; i < ROWS * D / 4; i += 32 * NSG) {
+        const uint row = i / (D / 4), c = i % (D / 4);
+        const uint g = row / L, t = row % L;
+        const device T* qp = q + (hk * GROUP + g) * q_strides[1] + t * q_strides[2] + (c * 4) * q_strides[3];
+        qs[row][c] = float4(float(qp[0]), float(qp[q_strides[3]]), float(qp[2 * q_strides[3]]), float(qp[3 * q_strides[3]])) * qscale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (split >= NSPLIT) return;
     const int s0 = int(split) * chunk;
     const int s1 = min(S, s0 + chunk);
     const device T* kb = k + hk * k_strides[1];
     const device T* vb = v + hk * v_strides[1];
-    float m[GROUP], l[GROUP], acc[GROUP][4];
-    for (int g = 0; g < GROUP; ++g) { m[g] = -INFINITY; l[g] = 0.0f; for (int i = 0; i < 4; ++i) acc[g][i] = 0.0f; }
-    for (int tile = s0 + int(sg) * 32; tile < s1; tile += NSG * 32) {
+    float m[ROWS], l[ROWS], acc[ROWS][4];
+    for (int r = 0; r < ROWS; ++r) { m[r] = -INFINITY; l[r] = 0.0f; for (int i = 0; i < 4; ++i) acc[r][i] = 0.0f; }
+    for (int tile = s0; tile < s1; tile += 32) {
         const int j = tile + int(lane);
-        float sc[GROUP];
+        float sc[ROWS];
         if (j < s1 && j >= lp) {
-            for (int g = 0; g < GROUP; ++g) sc[g] = 0.0f;
+            float kd[ROWS];
+            for (int r = 0; r < ROWS; ++r) kd[r] = 0.0f;
             const device T* kp = kb + (size_t)j * k_strides[2];
             for (int c = 0; c < D / 4; ++c) {
                 const float4 kv = float4(float(kp[4 * c]), float(kp[4 * c + 1]), float(kp[4 * c + 2]), float(kp[4 * c + 3]));
-                for (int g = 0; g < GROUP; ++g) sc[g] += dot(qs[g][c], kv);
+                for (int r = 0; r < ROWS; ++r) kd[r] += dot(qs[r][c], kv);
             }
-            const int d = S - 1 - j;
-            if (d < R) {
-                for (int g = 0; g < GROUP; ++g) sc[g] += float(rel[(hk * GROUP + g) * R + d]) * LOG2E;
+            for (int r = 0; r < ROWS; ++r) {
+                const int g = r / L, t = r % L;
+                const int d = S - L + t - j;   // causal distance of query t
+                float s = d < 0 ? -INFINITY : kd[r];
+                if (d >= 0 && d < R) s += float(rel[(t * HQ + hk * GROUP + g) * R + d]) * LOG2E;
+                sc[r] = s;
             }
         } else {
-            for (int g = 0; g < GROUP; ++g) sc[g] = -INFINITY;
+            for (int r = 0; r < ROWS; ++r) sc[r] = -INFINITY;
         }
-        float p[GROUP];
-        for (int g = 0; g < GROUP; ++g) {
-            const float mn = max(m[g], simd_max(sc[g]));
-            const float f = m[g] == -INFINITY ? 0.0f : fast::exp2(m[g] - mn);
-            p[g] = sc[g] == -INFINITY ? 0.0f : fast::exp2(sc[g] - mn);
-            l[g] = l[g] * f + simd_sum(p[g]);
-            for (int i = 0; i < 4; ++i) acc[g][i] *= f;
-            m[g] = mn;
+        float p[ROWS];
+        for (int r = 0; r < ROWS; ++r) {
+            const float mn = max(m[r], simd_max(sc[r]));
+            if (mn == -INFINITY) { p[r] = 0.0f; continue; }
+            const float f = m[r] == -INFINITY ? 0.0f : fast::exp2(m[r] - mn);
+            p[r] = sc[r] == -INFINITY ? 0.0f : fast::exp2(sc[r] - mn);
+            l[r] = l[r] * f + simd_sum(p[r]);
+            for (int i = 0; i < 4; ++i) acc[r][i] *= f;
+            m[r] = mn;
         }
         const int nk = min(32, s1 - tile);
         for (int kk = 0; kk < nk; ++kk) {
             const device T* vp = vb + (size_t)(tile + kk) * v_strides[2] + lane * 4;
             const float4 vv = float4(float(vp[0]), float(vp[1]), float(vp[2]), float(vp[3]));
-            for (int g = 0; g < GROUP; ++g) {
-                const float pk = simd_shuffle(p[g], ushort(kk));
-                for (int i = 0; i < 4; ++i) acc[g][i] += pk * vv[i];
+            for (int r = 0; r < ROWS; ++r) {
+                const float pk = simd_shuffle(p[r], ushort(kk));
+                for (int i = 0; i < 4; ++i) acc[r][i] += pk * vv[i];
             }
         }
     }
-    threadgroup float sm[NSG][GROUP];
-    threadgroup float sl[NSG][GROUP];
-    threadgroup float sacc[NSG][GROUP][D];
-    for (int g = 0; g < GROUP; ++g) {
-        if (lane == 0) { sm[sg][g] = m[g]; sl[sg][g] = l[g]; }
-        for (int i = 0; i < 4; ++i) sacc[sg][g][lane * 4 + i] = acc[g][i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        for (int g = 0; g < GROUP; ++g) {
-            float mt = -INFINITY;
-            for (int w = 0; w < NSG; ++w) mt = max(mt, sm[w][g]);
-            float lt = 0.0f;
-            float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            if (mt > -INFINITY) {
-                for (int w = 0; w < NSG; ++w) {
-                    const float f = fast::exp2(sm[w][g] - mt);
-                    lt += sl[w][g] * f;
-                    for (int i = 0; i < 4; ++i) o[i] += sacc[w][g][lane * 4 + i] * f;
-                }
-            }
-            device float* pp = part + ((size_t)(hk * GROUP + g) * NSPLIT + split) * (D + 2);
-            for (int i = 0; i < 4; ++i) pp[lane * 4 + i] = o[i];
-            if (lane == 0) { pp[D] = mt; pp[D + 1] = lt; }
-        }
+    for (int r = 0; r < ROWS; ++r) {
+        const int g = r / L, t = r % L;
+        // partial layout: [1, HQ, L, NSPLIT, D + 2]
+        device float* pp = part + (((size_t)(hk * GROUP + g) * L + t) * NSPLIT + split) * (D + 2);
+        for (int i = 0; i < 4; ++i) pp[lane * 4 + i] = acc[r][i];
+        if (lane == 0) { pp[D] = m[r]; pp[D + 1] = l[r]; }
     }
 """
 _long_attn_kernels: dict = {}
 LONG_ATTN_MIN_KEYS = int(os.environ.get("OMLX_INKLING2_LONG_ATTN_MIN", "4096"))
-LONG_ATTN_KEYS_PER_SPLIT = int(os.environ.get("OMLX_INKLING2_LONG_ATTN_SPLIT", "1024"))
+LONG_ATTN_KEYS_PER_SPLIT = int(os.environ.get("OMLX_INKLING2_LONG_ATTN_SPLIT", "256"))
 LONG_ATTN_NSG = int(os.environ.get("OMLX_INKLING2_LONG_ATTN_NSG", "8"))
 
 
+LONG_ATTN_MAX_QUERIES = 4
+
+
 def long_decode_attention(q, k, v, rel, sink, *, scale, left_padding=None):
-    """Full-attention decode for one row and one query: q [1, Hq, 1, D].
+    """Full-attention decode/verify for one row: q [1, Hq, L, D], L <= 8.
 
     ``left_padding`` ([1] array, optional) skips the row's padded key columns
     on the GPU, so no host sync is needed."""
-    _, hq, _, d = q.shape
+    _, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
     group = hq // hkv
     r = rel.shape[-1]
     nsplit = max(1, -(-s // LONG_ATTN_KEYS_PER_SPLIT))
+    nsplit = -(-nsplit // LONG_ATTN_NSG) * LONG_ATTN_NSG
     chunk = -(-s // nsplit)
-    key = (hq, hkv, d, r, q.dtype, LONG_ATTN_NSG)
+    key = (hq, hkv, d, r, q.dtype, LONG_ATTN_NSG, length)
     kern = _long_attn_kernels.get(key)
     if kern is None:
         kern = _long_attn_kernels[key] = mx.fast.metal_kernel(
@@ -1449,23 +1444,24 @@ def long_decode_attention(q, k, v, rel, sink, *, scale, left_padding=None):
             source=_ATTN_MERGE_SOURCE,
             ensure_row_contiguous=False,
         )
+    lp = (left_padding.reshape(1).astype(mx.int32) if left_padding is not None
+          else mx.zeros((1,), dtype=mx.int32))
     part = kern(
-        inputs=[q, k, v, mx.contiguous(rel.reshape(hq, r)),
-                mx.concatenate([mx.array([chunk], dtype=mx.int32),
-                                (left_padding.reshape(1).astype(mx.int32) if left_padding is not None
-                                 else mx.zeros((1,), dtype=mx.int32))]),
+        inputs=[q, k, v, mx.contiguous(rel.reshape(length, hq, r)),
+                mx.concatenate([mx.array([chunk], dtype=mx.int32), lp]),
                 mx.array([scale], dtype=mx.float32)],
-        template=[("T", q.dtype), ("D", d), ("GROUP", group), ("R", r), ("NSG", LONG_ATTN_NSG), ("NSPLIT", nsplit)],
-        grid=(32 * LONG_ATTN_NSG, nsplit, hkv),
+        template=[("T", q.dtype), ("D", d), ("GROUP", group), ("R", r), ("NSG", LONG_ATTN_NSG),
+                  ("NSPLIT", nsplit), ("L", length), ("HQ", hq)],
+        grid=(32 * LONG_ATTN_NSG, nsplit // LONG_ATTN_NSG, hkv),
         threadgroup=(32 * LONG_ATTN_NSG, 1, 1),
-        output_shapes=[(1, hq, 1, nsplit, d + 2)],
+        output_shapes=[(1, hq, length, nsplit, d + 2)],
         output_dtypes=[mx.float32],
     )[0]
     return merge(
         inputs=[part, sink],
         template=[("T", q.dtype), ("D", d), ("HQ", hq), ("NSPLIT", nsplit)],
-        grid=(32 * hq, 1, 1),
+        grid=(32 * hq * length, 1, 1),
         threadgroup=(32, 1, 1),
-        output_shapes=[(1, hq, 1, d)],
+        output_shapes=[(1, hq, length, d)],
         output_dtypes=[q.dtype],
     )[0]
