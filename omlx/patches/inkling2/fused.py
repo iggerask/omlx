@@ -25,6 +25,7 @@ import mlx.core as mx
 
 MAX_TOKENS = 16
 _ONE = mx.ones((1,), dtype=mx.float32)
+mx.eval(_ONE)
 
 
 def enabled(part: str = "") -> bool:
@@ -332,4 +333,194 @@ def combine(z, inds, weights, gscale, inv_denom, out_dtype):
         threadgroup=(min(256, h), 1, 1),
         output_shapes=[(n, h)],
         output_dtypes=[out_dtype],
+    )[0]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic short conv (full-attention k/v): taps static_w[lag] + dyn[head, lag]
+# ---------------------------------------------------------------------------
+
+_DCONV_SOURCE = """
+    const uint c = thread_position_in_grid.x;
+    const uint b = thread_position_in_grid.y;
+    const int C = x_shape[2];
+    const int L = x_shape[1];
+    if ((int)c >= C) return;
+    constexpr int KM = K - 1;
+    const int head = c / (C / HEADS);
+    float win[KM + MAXL];
+    for (int j = 0; j < KM; ++j) {
+        win[j] = state[b * state_strides[0] + j * state_strides[1] + c * state_strides[2]];
+    }
+    for (int t = 0; t < L; ++t) {
+        win[KM + t] = float(x[b * x_strides[0] + t * x_strides[1] + c * x_strides[2]]);
+    }
+    const int R = KM + L;
+    for (int r = 0; r < R; ++r) {
+        xp[(b * R + r) * C + c] = win[r];
+    }
+    float sw[K];
+    for (int lag = 0; lag < K; ++lag) {
+        sw[lag] = float(w[lag * w_strides[0] + c * w_strides[1]]);
+    }
+    for (int t = 0; t < L; ++t) {
+        float acc = 0.0f;
+        for (int lag = 0; lag < K; ++lag) {
+            const float d = float(dyn[b * dyn_strides[0] + t * dyn_strides[1] + (head * K + lag) * dyn_strides[2]]);
+            const float term = win[KM + t - lag] * (sw[lag] + d);
+            acc = lag == 0 ? term : acc + term;
+        }
+        out[(b * L + t) * C + c] = OT((acc + win[KM + t]) * SCALE);
+    }
+"""
+_dconv_kernels: dict = {}
+
+
+def dynamic_conv(x, dyn, static_w, state, heads: int, scale: float):
+    """Fused ``model._dynamic_conv``: returns ``(out, xp)``."""
+    b, length, c = x.shape
+    k = static_w.shape[0]
+    key = (k, heads, float(scale))
+    kern = _dconv_kernels.get(key)
+    if kern is None:
+        kern = _dconv_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_dynamic_conv_{len(_dconv_kernels)}",
+            input_names=["x", "dyn", "w", "state"],
+            output_names=["out", "xp"],
+            source=_DCONV_SOURCE.replace("SCALE", f"{float(scale)!r}f"),
+            ensure_row_contiguous=False,
+        )
+    if state.dtype != mx.float32:
+        state = state.astype(mx.float32)
+    return kern(
+        inputs=[x, dyn, static_w, state],
+        template=[("K", k), ("HEADS", heads), ("MAXL", MAX_TOKENS), ("OT", x.dtype)],
+        grid=(c, b, 1),
+        threadgroup=(min(256, c), 1, 1),
+        output_shapes=[(b, length, c), (b, k - 1 + length, c)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Loop message gates: (1 - tanh(forget)) * x + tanh(gain) * message
+# ---------------------------------------------------------------------------
+
+# Stage 1: the down projection split over hidden chunks so the 2 x H x r
+# weights stream coalesced through many threadgroups. Each threadgroup (one
+# thread per rank output) recomputes the unit RMS of its row, rounds the
+# normalized inputs to BF16 like the reference, and writes a partial sum.
+_MSG_DOWN_SOURCE = """
+    const uint g = threadgroup_position_in_grid.x;
+    const uint nr = threadgroup_position_in_grid.y;
+    const uint tid = thread_position_in_threadgroup.x;
+    const int n = nr / ROWS;
+    threadgroup float red[2 * (RANK / 32)];
+    const device float* xr = x + (size_t)nr * H;
+    const device float* mr = msg + (size_t)nr * H;
+    float sx = 0.0f, sm = 0.0f;
+    for (int i = tid; i < H; i += RANK) {
+        const float a = xr[i];
+        const float m = mr[i];
+        sx += a * a;
+        sm += m * m;
+    }
+    sx = simd_sum(sx);
+    sm = simd_sum(sm);
+    if (tid % 32 == 0) { red[tid / 32] = sx; red[RANK / 32 + tid / 32] = sm; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tx = 0.0f, tm = 0.0f;
+    for (int i = 0; i < RANK / 32; ++i) { tx += red[i]; tm += red[RANK / 32 + i]; }
+    const float fx = metal::precise::rsqrt(tx / float(H) + 1e-6f);
+    const float fm = metal::precise::rsqrt(tm / float(H) + 1e-6f);
+    const device float* d0 = down + (size_t)n * 2 * H * RANK;
+    const device float* d1 = d0 + (size_t)H * RANK;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const int i0 = g * CH;
+    for (int i = i0; i < i0 + CH; ++i) {
+        const float zx = float(bfloat16_t(xr[i] * fx));
+        const float zm = float(bfloat16_t(mr[i] * fm));
+        acc0 += zx * d0[(size_t)i * RANK + tid];
+        acc1 += zm * d1[(size_t)i * RANK + tid];
+    }
+    part[((size_t)nr * G + g) * RANK + tid] = acc0;
+    part[(((size_t)NR + nr) * G + g) * RANK + tid] = acc1;
+"""
+
+# Stage 2, one thread per (n, row, h): reduce the partials to the BF16-rounded
+# low-rank state, then gain/forget columns h and H + h and the mix.
+_MSG_UP_SOURCE = """
+    const uint h = thread_position_in_grid.x;
+    const uint nr = thread_position_in_grid.y;
+    const uint tid = thread_position_in_threadgroup.x;
+    const int n = nr / ROWS;
+    threadgroup float lr[RANK];
+    if (tid < RANK) {
+        float a0 = 0.0f, a1 = 0.0f;
+        for (int g = 0; g < G; ++g) {
+            a0 += part[((size_t)nr * G + g) * RANK + tid];
+            a1 += part[(((size_t)NR + nr) * G + g) * RANK + tid];
+        }
+        lr[tid] = float(bfloat16_t(a0 + a1));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int)h >= H) return;
+    const device float* gf = gain_forget + (size_t)n * RANK * 2 * H;
+    float ga = 0.0f, fo = 0.0f;
+    for (int k = 0; k < RANK; ++k) {
+        const float l = lr[k];
+        ga += l * gf[(size_t)k * 2 * H + h];
+        fo += l * gf[(size_t)k * 2 * H + H + h];
+    }
+    const float gain = metal::precise::tanh(ga);
+    const float forget = metal::precise::tanh(fo);
+    const size_t i = (size_t)nr * H + h;
+    out[i] = (1.0f - forget) * x[i] + gain * msg[i];
+"""
+_msg_kernels: dict = {}
+_MSG_CHUNK = 64
+
+
+def mix_messages(x, message, down, gain_forget):
+    """Fused ``model._mix_messages`` for [N, B, L, H] FP32 inputs."""
+    n, b, length, hidden = x.shape
+    rows = b * length
+    rank = down.shape[-1]
+    ch = _MSG_CHUNK if hidden % _MSG_CHUNK == 0 else 1
+    groups = hidden // ch
+    key = (hidden, rank, rows, n)
+    kerns = _msg_kernels.get(key)
+    if kerns is None:
+        kerns = _msg_kernels[key] = (
+            mx.fast.metal_kernel(
+                name=f"inkling2_msg_down_{len(_msg_kernels)}",
+                input_names=["x", "msg", "down"],
+                output_names=["part"],
+                source=_MSG_DOWN_SOURCE,
+            ),
+            mx.fast.metal_kernel(
+                name=f"inkling2_msg_up_{len(_msg_kernels)}",
+                input_names=["part", "gain_forget", "x", "msg"],
+                output_names=["out"],
+                source=_MSG_UP_SOURCE,
+            ),
+        )
+    x = x.astype(mx.float32)
+    message = message.astype(mx.float32)
+    nr = n * rows
+    part = kerns[0](
+        inputs=[x, message, down],
+        template=[("H", hidden), ("RANK", rank), ("ROWS", rows), ("CH", ch), ("G", groups), ("NR", nr)],
+        grid=(rank * groups, nr, 1),
+        threadgroup=(rank, 1, 1),
+        output_shapes=[(2, nr, groups, rank)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return kerns[1](
+        inputs=[part, gain_forget, x, message],
+        template=[("H", hidden), ("RANK", rank), ("ROWS", rows), ("G", groups), ("NR", nr)],
+        grid=(hidden, nr, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
     )[0]

@@ -355,6 +355,12 @@ class AttnResQuery(nn.Module):
 
 
 def _mix_messages(x, message, down, gain_forget):
+    if x.shape[1] * x.shape[2] <= fused.MAX_TOKENS and fused.enabled("msg"):
+        return fused.mix_messages(x, message, down, gain_forget)
+    return _mix_messages_ref(x, message, down, gain_forget)
+
+
+def _mix_messages_ref(x, message, down, gain_forget):
     """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
 
     ``x`` and ``message`` are [N, B, L, H] FP32, one row per controlled input.
@@ -401,6 +407,12 @@ def _short_conv(x, w, state, scale):
     if x.shape[1] <= fused.MAX_TOKENS and fused.enabled("conv"):
         return fused.static_conv(x, w, state, scale)
     return _static_conv(x, w, state, scale)
+
+
+def _dyn_conv(x, dyn, static_w, state, heads, scale):
+    if x.shape[1] <= fused.MAX_TOKENS and fused.enabled("dconv"):
+        return fused.dynamic_conv(x, dyn, static_w, state, heads, scale)
+    return _dynamic_conv(x, dyn, static_w, state, heads, scale)
 
 
 def _dynamic_conv(x, dyn, static_w, state, heads, scale):
@@ -476,6 +488,9 @@ class Inkling2Attention(nn.Module):
         if self.log_floor is None:
             return None
         offset = kv.offset if kv is not None else 0
+        if not isinstance(offset, mx.array) and offset + length <= self.log_floor:
+            # Positions below the floor scale by exactly 1.
+            return None
         if isinstance(offset, mx.array):
             offset = offset.reshape(-1, 1)
         pos = mx.arange(length) + offset
@@ -507,7 +522,7 @@ class Inkling2Attention(nn.Module):
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
             vp = self.v_proj(xv)
-            k, ks = _dynamic_conv(
+            k, ks = _dyn_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
                 self.k_static,
@@ -515,7 +530,7 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
-            v, vs = _dynamic_conv(
+            v, vs = _dyn_conv(
                 vp[..., :dkv],
                 vp[..., dkv:],
                 self.v_static,
