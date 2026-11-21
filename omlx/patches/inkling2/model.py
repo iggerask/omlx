@@ -27,7 +27,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import fused, kernels
+from . import fused, kernels, ragged
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -488,7 +488,8 @@ class Inkling2Attention(nn.Module):
         if self.log_floor is None:
             return None
         offset = kv.offset if kv is not None else 0
-        if not isinstance(offset, mx.array) and offset + length <= self.log_floor:
+        bound = offset if not isinstance(offset, mx.array) else getattr(kv, "_idx", None)
+        if bound is not None and bound + length <= self.log_floor:
             # Positions below the floor scale by exactly 1.
             return None
         if isinstance(offset, mx.array):
@@ -585,9 +586,28 @@ class Inkling2Attention(nn.Module):
         )
 
     def attend(self, q, k, v, rel, sink, kv):
+        row_ends = getattr(kv, "row_ends", None) if kv is not None else None
+        small = q.shape[2] <= fused.MAX_TOKENS and fused.enabled("attn")
+        if row_ends is not None and not small:
+            kv.align()
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+        row_ends = getattr(kv, "row_ends", None) if kv is not None else None
+        # The fused kernel wins for batched decode and is the only path that
+        # reads per-row ends; single-row decode and verify keep MLX SDPA.
+        if small and (row_ends is not None or (q.shape[0] > 1 and q.shape[2] == 1)):
+            return fused.small_attention(
+                q,
+                k,
+                v,
+                rel,
+                sink,
+                scale=self.scale,
+                window=self.window,
+                left_padding=left_padding,
+                row_ends=row_ends,
+            )
         return kernels.banded_sink_attention(
             q,
             k,
@@ -920,13 +940,25 @@ class Model(nn.Module):
             drafter.observe(scope, captures)
             return logits
         if return_hidden:
+            # Multi-token forwards mark a rollback state, so batched verify
+            # rolls each row back in place (rollback_speculative_cache).
+            rollback = (
+                {"verify_len": int(inputs.shape[1])}
+                if inputs is not None and inputs.ndim == 2 and inputs.shape[1] > 1
+                and fused.enabled("batch")
+                else None
+            )
             return SimpleNamespace(
-                logits=logits, hidden_states=captures + [h], gdn_states=None
+                logits=logits, hidden_states=captures + [h], gdn_states=rollback
             )
         return SimpleNamespace(logits=logits, hidden_states=captures)
 
-    # Rows that accept different counts would need a ragged conv rollback.
-    _omlx_drafter_single_row = True
+    @property
+    def _omlx_drafter_single_row(self) -> bool:
+        # Batched verify rolls rows back by different counts (ragged KV ends
+        # and per-row conv windows); OMLX_INKLING2_FUSED_OFF=batch restores
+        # single-request Lightning MTP.
+        return not fused.enabled("batch")
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
@@ -946,10 +978,40 @@ class Model(nn.Module):
         return True
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        accepted = int(accepted)
-        if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
-            raise RuntimeError("Inkling 2 verify rollback found no conv windows")
-        return accepted
+        """Keep ``accepted[b] + 1`` of the verified tokens of each row ``b``.
+
+        KV rows are trimmed by their own counts (ragged batch caches keep a
+        per-row end) and each row's conv states are re-cut from the verify
+        windows at its own accepted boundary."""
+        verify_len = int(block_size)
+        if isinstance(gdn_states, dict) and gdn_states.get("verify_len"):
+            verify_len = int(gdn_states["verify_len"])
+        if isinstance(accepted, mx.array):
+            accepted = accepted.reshape(-1).tolist()
+        if isinstance(accepted, (int, float)):
+            if not self.mtp_partial_rollback(caches, int(accepted), verify_len - 1):
+                raise RuntimeError("Inkling 2 verify rollback found no conv windows")
+            return int(accepted)
+        acc = [int(a) for a in accepted]
+        if len(set(acc)) == 1:
+            if not self.mtp_partial_rollback(caches, acc[0], verify_len - 1):
+                raise RuntimeError("Inkling 2 verify rollback found no conv windows")
+            return acc
+        keeps = [a + 1 for a in acc]
+        drops = [verify_len - k for k in keeps]
+        width = self.args.text.sconv_kernel_size - 1
+        index = (mx.array(keeps, dtype=mx.int32)[:, None] + mx.arange(width, dtype=mx.int32)[None])[..., None]
+        for entry in caches:
+            kv, conv = entry[0], entry[1]
+            if not getattr(kv, "is_speculating", False):
+                ragged.upgrade(kv).trim_rows(drops)
+            windows = getattr(conv, "_omlx_verify_xp", None)
+            if windows is None:
+                raise RuntimeError("Inkling 2 verify rollback found no conv windows")
+            for slot, window in windows.items():
+                conv[slot] = mx.take_along_axis(window, index, axis=1)
+            conv._omlx_verify_xp = None
+        return acc
 
     @property
     def layers(self):

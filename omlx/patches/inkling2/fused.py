@@ -524,3 +524,217 @@ def mix_messages(x, message, down, gain_forget):
         output_shapes=[x.shape],
         output_dtypes=[mx.float32],
     )[0]
+
+
+# ---------------------------------------------------------------------------
+# Small-query attention (decode, verify, small batches)
+# ---------------------------------------------------------------------------
+
+# Split-key attention. Stage 1: one threadgroup per (b, kv head, block of query
+# rows, key split). Query rows are the GROUP q heads of the kv head times the L
+# positions, so each K/V row is read once for all of them. Each simdgroup
+# streams every NSG-th key of the split with an online softmax per query row
+# (lanes hold D/32 dims); the simdgroups merge into one partial (m, l, acc) per
+# split. Stage 2 merges the splits and adds the zero-value sink once.
+# Row b's query t sits at a = end[b] - L + t; keys j in [max(lp[b], a - W + 1), a]
+# are visible, with the relative bias rel[b, t, h, a - j] for a - j < R.
+_ATTN_SOURCE = """
+    constexpr int DPL = D / 32;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const int hk = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const int qblk = threadgroup_position_in_grid.x / NSPLIT;
+    const int split = threadgroup_position_in_grid.x % NSPLIT;
+    const int L = params[0];
+    const int span0 = params[1];
+    const int chunk = params[2];
+    const int lp = params[3 + b];
+    const int end = params[3 + B + b];
+    const int nrows = L * GROUP;
+    const int r0 = qblk * QR;
+    const int nq = min(QR, nrows - r0);
+    const float qscale = params_f[0] * LOG2E;
+
+    float qv[QR][DPL];
+    float m[QR], l[QR], acc[QR][DPL];
+    int qa[QR], qh[QR], qt[QR];
+    for (int r = 0; r < QR; ++r) {
+        m[r] = -INFINITY; l[r] = 0.0f;
+        for (int i = 0; i < DPL; ++i) { acc[r][i] = 0.0f; qv[r][i] = 0.0f; }
+        qa[r] = -1; qh[r] = 0; qt[r] = 0;
+        if (r < nq) {
+            const int row = r0 + r;
+            const int t = row / GROUP;
+            const int h = hk * GROUP + row % GROUP;
+            qt[r] = t; qh[r] = h; qa[r] = end - L + t;
+            const device T* qp = q + b * q_strides[0] + h * q_strides[1] + t * q_strides[2];
+            for (int i = 0; i < DPL; ++i) {
+                qv[r][i] = float(qp[(lane + 32 * i) * q_strides[3]]) * qscale;
+            }
+        }
+    }
+    int kmax = qa[0];
+    int kmin = qa[0];
+    for (int r = 1; r < nq; ++r) { kmax = max(kmax, qa[r]); kmin = min(kmin, qa[r]); }
+    int lo = lp;
+    if (WINDOW > 0) lo = max(lo, kmin - WINDOW + 1);
+    const int s0 = span0 + split * chunk;
+    const int j0 = max(lo, s0);
+    const int j1 = min(kmax, s0 + chunk - 1);
+    const device T* kb = k + b * k_strides[0] + hk * k_strides[1];
+    const device T* vb = v + b * v_strides[0] + hk * v_strides[1];
+    for (int j = j0 + (int)sg; j <= j1; j += NSG) {
+        float kv[DPL], vv[DPL];
+        for (int i = 0; i < DPL; ++i) {
+            kv[i] = float(kb[j * k_strides[2] + (lane + 32 * i) * k_strides[3]]);
+            vv[i] = float(vb[j * v_strides[2] + (lane + 32 * i) * v_strides[3]]);
+        }
+        for (int r = 0; r < QR; ++r) {
+            if (r >= nq) break;
+            const int d = qa[r] - j;
+            if (d < 0 || (WINDOW > 0 && d >= WINDOW)) continue;
+            float s = 0.0f;
+            for (int i = 0; i < DPL; ++i) s += qv[r][i] * kv[i];
+            s = simd_sum(s);
+            if (d < R) {
+                s += float(rel[((b * L + qt[r]) * HQ + qh[r]) * R + d]) * LOG2E;
+            }
+            const float mn = max(m[r], s);
+            const float f = fast::exp2(m[r] - mn);
+            const float p = fast::exp2(s - mn);
+            l[r] = l[r] * f + p;
+            for (int i = 0; i < DPL; ++i) acc[r][i] = acc[r][i] * f + p * vv[i];
+            m[r] = mn;
+        }
+    }
+    threadgroup float sm[NSG];
+    threadgroup float sl[NSG];
+    threadgroup float sacc[NSG * D];
+    for (int r = 0; r < nq; ++r) {
+        if (lane == 0) { sm[sg] = m[r]; sl[sg] = l[r]; }
+        for (int i = 0; i < DPL; ++i) sacc[sg * D + lane + 32 * i] = acc[r][i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            float mt = -INFINITY;
+            for (int g = 0; g < NSG; ++g) mt = max(mt, sm[g]);
+            float lt = 0.0f;
+            float o[DPL];
+            for (int i = 0; i < DPL; ++i) o[i] = 0.0f;
+            if (mt > -INFINITY) {
+                for (int g = 0; g < NSG; ++g) {
+                    const float f = fast::exp2(sm[g] - mt);
+                    lt += sl[g] * f;
+                    for (int i = 0; i < DPL; ++i) o[i] += sacc[g * D + lane + 32 * i] * f;
+                }
+            }
+            // partial layout: [B, HQ, L, NSPLIT, D + 2]
+            device float* pp = part + ((((size_t)b * HQ + qh[r]) * L + qt[r]) * NSPLIT + split) * (D + 2);
+            for (int i = 0; i < DPL; ++i) pp[lane + 32 * i] = o[i];
+            if (lane == 0) { pp[D] = mt; pp[D + 1] = lt; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
+# Stage 2: one simdgroup per (b, h, t): merge NSPLIT partials and the sink.
+_ATTN_MERGE_SOURCE = """
+    constexpr int DPL = D / 32;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x;   // ((b * HQ + h) * L + t)
+    const int L = part_shape[2];
+    const int t = row % L;
+    const int h = (row / L) % HQ;
+    const int b = row / (L * HQ);
+    const device float* pp = part + (size_t)row * NSPLIT * (D + 2);
+    const float sk = float(sink[b * sink_strides[0] + t * sink_strides[1] + h * sink_strides[2]]) * LOG2E;
+    float mt = sk;
+    for (int g = 0; g < NSPLIT; ++g) mt = max(mt, pp[g * (D + 2) + D]);
+    float lt = fast::exp2(sk - mt);
+    float o[DPL];
+    for (int i = 0; i < DPL; ++i) o[i] = 0.0f;
+    for (int g = 0; g < NSPLIT; ++g) {
+        const float mg = pp[g * (D + 2) + D];
+        if (mg == -INFINITY) continue;
+        const float f = fast::exp2(mg - mt);
+        lt += pp[g * (D + 2) + D + 1] * f;
+        for (int i = 0; i < DPL; ++i) o[i] += pp[g * (D + 2) + lane + 32 * i] * f;
+    }
+    const float inv = 1.0f / lt;
+    device T* op = out + (size_t)row * D;
+    for (int i = 0; i < DPL; ++i) op[lane + 32 * i] = T(o[i] * inv);
+"""
+_attn_kernels: dict = {}
+_ATTN_QR = 8
+_ATTN_NSG = 4
+_ATTN_KEYS_PER_SPLIT = 128
+_ATTN_MAX_SPLITS = 64
+
+
+def small_attention(q, k, v, rel, sink, *, scale, window, left_padding=None, row_ends=None):
+    """``kernels.banded_sink_attention`` for short query blocks.
+
+    q: [B, Hq, L, D]; k, v: [B, Hkv, S, D]; rel: [B, L, Hq, R]; sink: [B, L, Hq].
+    ``row_ends[b]`` is the number of key columns row b has written (default S),
+    so rows may end at different columns. Returns [B, Hq, L, D].
+    """
+    b, hq, length, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    group = hq // hkv
+    r = rel.shape[-1]
+    ends = list(row_ends) if row_ends is not None else [s] * b
+    # Keys any query can see: from the shortest row's window start for sliding layers.
+    base = max(0, min(ends) - length - int(window) + 1) if window else 0
+    span = s - base
+    nsplit = max(1, min(_ATTN_MAX_SPLITS, -(-span // _ATTN_KEYS_PER_SPLIT)))
+    chunk = -(-span // nsplit)
+    key = (hq, hkv, d, r, int(window), q.dtype, b, nsplit)
+    kerns = _attn_kernels.get(key)
+    if kerns is None:
+        kerns = _attn_kernels[key] = (
+            mx.fast.metal_kernel(
+                name=f"inkling2_small_attention_{len(_attn_kernels)}",
+                input_names=["q", "k", "v", "rel", "params", "params_f"],
+                output_names=["part"],
+                source=_ATTN_SOURCE,
+                ensure_row_contiguous=False,
+            ),
+            mx.fast.metal_kernel(
+                name=f"inkling2_small_attention_merge_{len(_attn_kernels)}",
+                input_names=["part", "sink"],
+                output_names=["out"],
+                source=_ATTN_MERGE_SOURCE,
+                ensure_row_contiguous=False,
+            ),
+        )
+    head = [length, base, chunk]
+    if left_padding is None:
+        params = mx.array(head + [0] * b + ends, dtype=mx.int32)
+    else:
+        params = mx.concatenate(
+            [mx.array(head, dtype=mx.int32), left_padding.astype(mx.int32), mx.array(ends, dtype=mx.int32)]
+        )
+    rows = length * group
+    blocks = -(-rows // _ATTN_QR)
+    tmpl = [
+        ("T", q.dtype), ("D", d), ("HQ", hq), ("GROUP", group), ("R", r), ("WINDOW", int(window)),
+        ("QR", _ATTN_QR), ("NSG", _ATTN_NSG), ("B", b), ("NSPLIT", nsplit),
+    ]
+    part = kerns[0](
+        inputs=[q, k, v, rel, params, mx.array([scale], dtype=mx.float32)],
+        template=tmpl,
+        grid=(blocks * nsplit * 32 * _ATTN_NSG, hkv, b),
+        threadgroup=(32 * _ATTN_NSG, 1, 1),
+        output_shapes=[(b, hq, length, nsplit, d + 2)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return kerns[1](
+        inputs=[part, sink],
+        template=[("T", q.dtype), ("D", d), ("HQ", hq), ("NSPLIT", nsplit)],
+        grid=(32 * b * hq * length, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, hq, length, d)],
+        output_dtypes=[q.dtype],
+    )[0]
