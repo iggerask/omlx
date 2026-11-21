@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -703,6 +704,11 @@ def _cumsum(xs):
 # the layer through compiled stages; longer prefill chunks stay eager, since
 # every new chunk length would otherwise retrace all layers.
 _COMPILED_MAX_TOKENS = 16
+# Prefill chunk lengths that also run compiled: the scheduler's chunk size, so
+# every chunk but a prompt's last reuses one trace per layer.
+_COMPILED_PREFILL_LENGTHS = frozenset(
+    int(n) for n in os.environ.get("OMLX_INKLING2_COMPILED_PREFILL", "2048").split(",") if n
+)
 
 
 class Inkling2Layer(nn.Module):
@@ -805,7 +811,12 @@ class Inkling2Layer(nn.Module):
                 s = mx.zeros((b, self._conv_k - 1, width), dtype=mx.float32)
             states.append(s)
         tau = self.attn.log_tau(kv, length)
-        compiled = length <= _COMPILED_MAX_TOKENS
+        compiled = length <= _COMPILED_MAX_TOKENS or (
+            length in _COMPILED_PREFILL_LENGTHS and fused.enabled("prefillcompile")
+        )
+        if compiled and length > _COMPILED_MAX_TOKENS and bank is not None and self.sliding:
+            # Built (and evaluated) outside the trace.
+            self.attn._row_projections()
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
         messages = self.loop_message(*bank) if bank is not None else None
