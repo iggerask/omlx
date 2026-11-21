@@ -28,12 +28,24 @@ _ONE = mx.ones((1,), dtype=mx.float32)
 mx.eval(_ONE)
 
 
+# Parts that stay off unless OMLX_INKLING2_FUSED_ON lists them. Batched DSpark
+# verify works but loses to plain batched decode on this model: every extra
+# verified token of a batch reads about as many new experts as a plain token.
+_DEFAULT_OFF = {"batch"}
+
+
 def enabled(part: str = "") -> bool:
     """``OMLX_INKLING2_FUSED=0`` turns every fusion off; ``..._OFF=moe,state``
-    turns off single parts."""
+    turns off single parts and ``..._ON=batch`` turns on default-off parts."""
     if os.environ.get("OMLX_INKLING2_FUSED", "1") == "0":
         return False
-    return not part or part not in os.environ.get("OMLX_INKLING2_FUSED_OFF", "").split(",")
+    if not part:
+        return True
+    if part in os.environ.get("OMLX_INKLING2_FUSED_OFF", "").split(","):
+        return False
+    if part in _DEFAULT_OFF:
+        return part in os.environ.get("OMLX_INKLING2_FUSED_ON", "").split(",")
+    return True
 
 
 # ---------------------------------------------------------------------------
