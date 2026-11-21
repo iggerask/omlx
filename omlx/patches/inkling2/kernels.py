@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
@@ -316,6 +318,7 @@ _FLASH_SOURCE = """
     }
 """
 _flash_kernel = None
+_MASK_KERNEL = os.environ.get("OMLX_INKLING2_MASK_KERNEL", "1") != "0"
 # Query blocks shorter than this keep the SDPA path (decode and verify).
 _FLASH_MIN_QUERIES = 32
 
@@ -405,6 +408,65 @@ def banded_sink_attention(
     return _masked_attention(q, k, v, rel, sink, scale, window, left_padding)
 
 
+_MASK_SOURCE = """
+    const uint j = thread_position_in_grid.x;   // mask column: 0 = sink, 1 + c = key lo + c
+    const uint i = thread_position_in_grid.y;   // query within the block
+    const uint bh = thread_position_in_grid.z;  // b * HQ + h
+    const int NK = dims[0];
+    const int NQ = dims[1];
+    if ((int)j > NK || (int)i >= NQ) return;
+    const int b = bh / HQ;
+    const int h = bh % HQ;
+    const int I0 = dims[2];   // first query of the block within the chunk
+    const int A0 = dims[3];   // absolute key position of query I0
+    const int LO = dims[4];   // first key column
+    const int iq = I0 + (int)i;
+    const size_t o = ((size_t)bh * NQ + i) * (NK + 1) + j;
+    if (j == 0) {
+        out[o] = T(sink[b * sink_strides[0] + iq * sink_strides[1] + h * sink_strides[2]]);
+        return;
+    }
+    const int kk = LO + (int)j - 1;
+    const int dist = A0 + (int)i - kk;
+    const float NEG = -INFINITY;
+    bool ok = dist >= 0 && kk >= dims[5 + b];
+    if (WINDOW > 0) ok = ok && dist < WINDOW;
+    if (!ok) { out[o] = T(NEG); return; }
+    out[o] = dist < R
+        ? T(rel[b * rel_strides[0] + iq * rel_strides[1] + h * rel_strides[2] + dist * rel_strides[3]])
+        : T(0.0f);
+"""
+_mask_kernel = None
+
+
+def _band_mask(rel, sink, *, i0, nq, a0, lo, nk, window, left_padding, dtype):
+    """The additive SDPA mask of one query block in a single kernel: [B, Hq, nq, 1 + nk]."""
+    global _mask_kernel
+    if _mask_kernel is None:
+        _mask_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_band_mask",
+            input_names=["rel", "sink", "dims"],
+            output_names=["out"],
+            source=_MASK_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    b, _, hq, r = rel.shape
+    lp = (
+        left_padding.astype(mx.int32)
+        if left_padding is not None
+        else mx.zeros((b,), dtype=mx.int32)
+    )
+    dims = mx.concatenate([mx.array([nk, nq, i0, a0, lo], dtype=mx.int32), lp])
+    return _mask_kernel(
+        inputs=[rel, sink, dims],
+        template=[("T", dtype), ("HQ", hq), ("R", r), ("WINDOW", int(window))],
+        grid=(nk + 1, nq, b * hq),
+        threadgroup=(min(256, nk + 1), 1, 1),
+        output_shapes=[(b, hq, nq, nk + 1)],
+        output_dtypes=[dtype],
+    )[0]
+
+
 def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     """MLX SDPA over an additive mask that carries the bias band and sinks."""
     b, hq, length, d = q.shape
@@ -435,6 +497,18 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
         hi = s - length + i1
         f = max(lo, a0 - r + 1)
         near = hi - f
+        if _MASK_KERNEL and q.dtype in (mx.bfloat16, mx.float16) and mx.default_device() == mx.gpu:
+            mask = _band_mask(
+                rel, sink, i0=i0, nq=nq, a0=a0, lo=lo, nk=nk, window=window,
+                left_padding=left_padding, dtype=q.dtype,
+            )
+            out = mx.fast.scaled_dot_product_attention(
+                q[:, :, i0:i1], kz, vz, scale=scale, mask=mask
+            )
+            if qb < length:
+                mx.eval(out)
+            outs.append(out)
+            continue
         dist = (a0 - f) + mx.arange(nq)[:, None] - mx.arange(near)[None, :]
         relq = rel[:, i0:i1].transpose(0, 2, 1, 3)
         gidx = mx.broadcast_to(mx.clip(dist, 0, r - 1), (b, hq, nq, near))
