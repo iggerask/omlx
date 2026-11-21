@@ -289,9 +289,11 @@ class Inkling2Experts(nn.Module):
         y4 = y.reshape(-1, 1, 1, y.shape[-1])
         act = fused.swiglu(y4, idx, g13, 1.0 / _NVFP4_DENOMINATOR, self._gcap_f, self._ucap_f)
         z = self.w2(act.reshape(y.shape[:-1] + (act.shape[-1],)), idx, True)
-        z = _scatter_unsort(z, inv, inds.shape)
         g2 = self.w2.global_scale if self.w2.mode == "nvfp4" else None
-        return fused.combine(z, inds, weights, g2, 1.0 / _NVFP4_DENOMINATOR, dtype)
+        # The expert sum reads the sorted outputs through the inverse order.
+        return fused.combine(
+            z, inds, weights, g2, 1.0 / _NVFP4_DENOMINATOR, dtype, perm=inv.astype(mx.uint32)
+        )
 
     def _fused(self, xe, dtype, inds, weights):
         y = self.w13(xe, inds, False)

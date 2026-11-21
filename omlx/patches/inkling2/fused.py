@@ -293,7 +293,8 @@ _COMBINE_SOURCE = """
     for (int k = 0; k < K; ++k) {
         float w = weights[n * K + k];
         if (HAS_SCALE) w = w * (gscale[inds[n * K + k]] * INV_DENOM);
-        acc += float(z[((size_t)n * K + k) * H + h]) * w;
+        const size_t row = PERM ? (size_t)perm[n * K + k] : (size_t)n * K + k;
+        acc += float(z[row * H + h]) * w;
     }
     out[(size_t)n * H + h] = OT(acc);
 """
@@ -336,17 +337,21 @@ def swiglu(y, inds, gscale, inv_denom, gcap, ucap):
     )[0]
 
 
-def combine(z, inds, weights, gscale, inv_denom, out_dtype):
-    """Weighted sum over the top-k expert outputs with the NVFP4 tensor scale."""
-    n, k, _, h = z.shape
+def combine(z, inds, weights, gscale, inv_denom, out_dtype, perm=None):
+    """Weighted sum over the top-k expert outputs with the NVFP4 tensor scale.
+
+    With ``perm``, ``z`` holds the outputs in expert-sorted order and the
+    output of (token n, slot k) is row ``perm[n * K + k]``."""
+    n, k = inds.shape[0], inds.shape[1]
+    h = z.shape[-1]
     has = gscale is not None
     kern = _moe_kernel(
-        "combine", _COMBINE_SOURCE, ["z", "inds", "weights", "gscale"], ["out"],
+        "combine", _COMBINE_SOURCE, ["z", "inds", "weights", "gscale", "perm"], ["out"],
         (("INV_DENOM", inv_denom),),
     )
     return kern(
-        inputs=[z, inds, weights, gscale if has else _ONE],
-        template=[("OT", out_dtype), ("H", h), ("K", k), ("HAS_SCALE", has)],
+        inputs=[z, inds, weights, gscale if has else _ONE, perm if perm is not None else _ONE],
+        template=[("OT", out_dtype), ("H", h), ("K", k), ("HAS_SCALE", has), ("PERM", perm is not None)],
         grid=(h, n, 1),
         threadgroup=(min(256, h), 1, 1),
         output_shapes=[(n, h)],
