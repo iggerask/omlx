@@ -123,7 +123,7 @@ def attn_res_mix(blocks: list, partial_n: mx.array, query: mx.array, scale: floa
     return out
 
 
-def _decode_attention(q, k, v, rel, sink, scale, window):
+def _decode_attention(q, k, v, rel, sink, scale, window, ring=None):
     s = k.shape[2]
     lo = max(0, s - window) if window else 0
     if lo:
@@ -136,6 +136,9 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
     tail = rel[0, 0, :, :n][:, ::-1]
     if n < sv:
         tail = mx.concatenate([mx.zeros((hq, sv - n), dtype=tail.dtype), tail], -1)
+    if ring:
+        # Keys of a rotating window are in ring order (oldest at ``ring``).
+        tail = mx.roll(tail, ring, axis=-1)
     mask = tail.reshape(1, hq, 1, sv).astype(q.dtype)
     return mx.fast.scaled_dot_product_attention(
         q, k, v, scale=scale, mask=mask, sinks=sink[0, 0].astype(q.dtype)

@@ -146,7 +146,8 @@ def upgrade(kv):
     if isinstance(kv, RaggedRowsMixin):
         return kv
     base = type(kv)
-    if not hasattr(kv, "left_padding") or not hasattr(kv, "_idx"):
+    if not hasattr(kv, "left_padding") or not hasattr(kv, "_idx") or hasattr(kv, "max_size"):
+        # Rotating windows keep their own ring bookkeeping.
         return kv
     cls = _classes.get(base)
     if cls is None:

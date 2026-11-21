@@ -26,7 +26,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.cache import RotatingKVCache, ArraysCache, CacheList, KVCache
 
 from . import fused, kernels, ragged
 from .loader import sanitize_weights
@@ -662,6 +662,18 @@ class Inkling2Attention(nn.Module):
             k, v = kv.update_and_fetch(k, v)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
         row_ends = getattr(kv, "row_ends", None) if kv is not None else None
+        shift = _ring_shift(kv, q.shape[2], k)
+        if shift is not None:
+            # A full rotating window after a one-token update: keys are in ring
+            # order with the oldest at slot ``shift``.
+            if q.shape[0] == 1:
+                return kernels._decode_attention(
+                    q, k, v, rel, sink, self.scale, self.window, ring=shift
+                )
+            k = mx.roll(k, -shift, axis=2)
+            v = mx.roll(v, -shift, axis=2)
+            if left_padding is not None:
+                left_padding = mx.maximum(left_padding, 0)
         # The fused kernel wins for batched decode and is the only path that
         # reads per-row ends; single-row decode and verify keep MLX SDPA.
         if small and (row_ends is not None or (q.shape[0] > 1 and q.shape[2] == 1)):
@@ -694,6 +706,17 @@ class Inkling2Attention(nn.Module):
             gate.dtype
         )
         return self.o_proj(out)
+
+
+def _ring_shift(kv, length, keys):
+    """Oldest slot of a full rotating window returned in ring order, else None."""
+    size = getattr(kv, "max_size", None)
+    if size is None or length != 1 or keys.shape[2] != size:
+        return None
+    offset = getattr(kv, "_offset", kv.offset)
+    if isinstance(offset, mx.array) or offset < size:
+        return None
+    return int(kv._idx) % size
 
 
 def _select_rows(layer, rows):
@@ -1200,10 +1223,20 @@ class Model(nn.Module):
 
     def make_cache(self):
         # One entry per layer visit: each loop pass keeps its own KV and conv
-        # states.
-        return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
-        ]
+        # states. Sliding layers only ever attend to their last window, so
+        # their KV lives in a window-sized rotating cache (full-context KV for
+        # 40 of 48 visits is ~20 GB at 128k tokens and pushes long prompts
+        # into memory pressure). OMLX_INKLING2_SLIDING_CACHE=0 keeps full KV.
+        rotating = os.environ.get("OMLX_INKLING2_SLIDING_CACHE", "1") != "0"
+        out = []
+        for idx, _ in self.model._schedule:
+            layer = self.model.layers[idx]
+            if rotating and layer.sliding:
+                kv = RotatingKVCache(max_size=layer.attn.window)
+            else:
+                kv = KVCache()
+            out.append(CacheList(kv, ArraysCache(4)))
+        return out
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)
