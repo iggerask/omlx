@@ -295,7 +295,25 @@ class Inkling2Experts(nn.Module):
             z, inds, weights, g2, 1.0 / _NVFP4_DENOMINATOR, dtype, perm=inv.astype(mx.uint32)
         )
 
+    def _nvfp4_ok(self, hidden, k):
+        """Shapes the fused NVFP4 kernels cover (512 values per simdgroup step)."""
+        w13, w2 = self.w13, self.w2
+        if w13.mode != "nvfp4" or w2.mode != "nvfp4" or w13.group_size != 16 or w2.group_size != 16:
+            return False
+        inter = w2.weight.shape[-1] * 8
+        return (2 * hidden) % 512 == 0 and (k * inter) % 512 == 0 and inter % 16 == 0
+
     def _fused(self, xe, dtype, inds, weights):
+        hidden = xe.shape[-1]
+        k = inds.shape[-1]
+        if fused.enabled("nvmv") and self._nvfp4_ok(hidden, k):
+            # NVFP4 decode/verify rows: gate/up + SwiGLU, then down + expert sum.
+            n = inds.size // k
+            act = fused.nvfp4_swiglu(xe.reshape(n, hidden), self.w13, inds.reshape(n, k), 1.0 / _NVFP4_DENOMINATOR,
+                                     self._gcap_f, self._ucap_f)
+            out = fused.nvfp4_down_sum(act.reshape(n, k, -1), self.w2, inds.reshape(n, k),
+                                       weights.reshape(n, k), 1.0 / _NVFP4_DENOMINATOR, dtype)
+            return out.reshape(inds.shape[:-1] + (hidden,))
         y = self.w13(xe, inds, False)
         g13 = self.w13.global_scale if self.w13.mode == "nvfp4" else None
         act = fused.swiglu(y, inds, g13, 1.0 / _NVFP4_DENOMINATOR, self._gcap_f, self._ucap_f)

@@ -1142,3 +1142,175 @@ def multi_norm(x, w, eps):
         output_shapes=[x.shape],
         output_dtypes=[mx.bfloat16],
     )[0]
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 expert matvecs for decode/verify rows (group 16, E2M1 codes, E4M3
+# group scales; the per-expert tensor scale is applied after the dot product).
+# MLX's fast quantized matvec needs K % 512 == 0; Inkling's K = 2304 / 1152
+# take its slower path. Here a simdgroup streams 512 values per step (32 lanes
+# x one 16-value group) over a gate/up row pair (2 x 2304 = 9 steps) or over
+# one down row of all top-k experts (8 x 1152 = 18 steps): no idle lanes.
+# ---------------------------------------------------------------------------
+
+_NVFP4_HEADER = """
+// E2M1 code -> float, MLX's bit placement (fp4.h): |c| << 9 as half, x 2^14.
+inline float e2m1(uint c) {
+    const float v = float(as_type<half>(ushort((c & 7u) << 9))) * 16384.0f;
+    return (c & 8u) ? -v : v;
+}
+// E4M3 byte -> float: exponent/mantissa into a half, x 2^8 (exact, incl. subnormals).
+inline float e4m3(uint b) {
+    const float v = float(as_type<half>(ushort((b & 0x7Fu) << 7))) * 256.0f;
+    return (b & 0x80u) ? -v : v;
+}
+inline float bf(ushort u) { return as_type<float>(uint(u) << 16); }
+// x . 16 E2M1 codes, like MLX's qdot (sum, then the caller scales).
+inline float dot16(uint2 w, thread const float* xv) {
+    float acc = 0.0f;
+    for (int j = 0; j < 8; ++j) acc += xv[j] * e2m1(w.x >> (4 * j));
+    for (int j = 0; j < 8; ++j) acc += xv[8 + j] * e2m1(w.y >> (4 * j));
+    return acc;
+}
+inline void load16(const device ushort* p, thread float* xv) {
+    const ushort4 a = ((const device ushort4*)p)[0], b = ((const device ushort4*)p)[1];
+    const ushort4 c = ((const device ushort4*)p)[2], d = ((const device ushort4*)p)[3];
+    xv[0] = bf(a.x); xv[1] = bf(a.y); xv[2] = bf(a.z); xv[3] = bf(a.w);
+    xv[4] = bf(b.x); xv[5] = bf(b.y); xv[6] = bf(b.z); xv[7] = bf(b.w);
+    xv[8] = bf(c.x); xv[9] = bf(c.y); xv[10] = bf(c.z); xv[11] = bf(c.w);
+    xv[12] = bf(d.x); xv[13] = bf(d.y); xv[14] = bf(d.z); xv[15] = bf(d.w);
+}
+"""
+
+_NV_W13_SOURCE = """
+    // grid: (32 * NSG, tiles, N * K); each simdgroup owns RP activation columns.
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint nk = threadgroup_position_in_grid.z;
+    const uint n = nk / K;
+    const uint e = inds[nk];
+    const device T* xr = x + (size_t)n * H;
+    const float sc = float(T(gscale[e] * INV_DENOM));
+    for (uint rp = 0; rp < RP; ++rp) {
+        const uint i = (threadgroup_position_in_grid.y * NSG + sg) * RP + rp;
+        if (i >= I) break;
+        // rows 2i (gate) and 2i + 1 (up) are adjacent: 2H contiguous values.
+        const device uint32_t* wp = w + ((size_t)e * 2 * I + 2 * i) * (H / 8);
+        const device uint8_t* sp = s + ((size_t)e * 2 * I + 2 * i) * (H / 16);
+        float part0 = 0.0f, part1 = 0.0f;
+        for (uint step = 0; step < (2 * H) / 512; ++step) {
+            const uint p = step * 512 + lane * 16;
+            const bool up = p >= H;
+            const uint off = up ? p - H : p;
+            float xv[16];
+            load16((const device ushort*)(xr + off), xv);
+            const float d = e4m3(sp[p / 16]) * dot16(((const device uint2*)wp)[p / 16], xv);
+            if (up) part1 += d; else part0 += d;
+        }
+        float g = simd_sum(part0);
+        float u = simd_sum(part1);
+        if (lane == 0) {
+            g = float(T(float(T(g)) * sc));
+            u = float(T(float(T(u)) * sc));
+            const float o = metal::precise::tanh(g / GCAP) * GCAP * (1.0f / (1.0f + metal::precise::exp(-g)))
+                * (metal::precise::tanh(u / UCAP) * UCAP);
+            act[(size_t)nk * I + i] = T(o);
+        }
+    }
+"""
+
+_NV_W2_SOURCE = """
+    // grid: (32 * NSG, tiles, N); each simdgroup owns RO output rows and sums
+    // the K experts' down rows as one dot product of K * I values.
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint n = threadgroup_position_in_grid.z;
+    for (uint ro = 0; ro < RO; ++ro) {
+        const uint r = (threadgroup_position_in_grid.y * NSG + sg) * RO + ro;
+        if (r >= H) break;
+        float part = 0.0f;
+        for (uint step = 0; step < (K * I) / 512; ++step) {
+            const uint p = step * 512 + lane * 16;
+            const uint k = p / I;
+            const uint off = p - k * I;
+            const uint e = inds[n * K + k];
+            const float wk = weights[n * K + k] * (HAS_SCALE ? gscale[e] * INV_DENOM : 1.0f);
+            const device uint32_t* wp = w + ((size_t)e * H + r) * (I / 8);
+            const device uint8_t* sp = s + ((size_t)e * H + r) * (I / 16);
+            const device T* ar = act + ((size_t)n * K + k) * I;
+            float xv[16];
+            load16((const device ushort*)(ar + off), xv);
+            part += wk * (e4m3(sp[off / 16]) * dot16(((const device uint2*)wp)[off / 16], xv));
+        }
+        part = simd_sum(part);
+        if (lane == 0) out[(size_t)n * H + r] = OT(part);
+    }
+"""
+_nv_kernels: dict = {}
+
+
+def _nv_kernel(name, source, inputs, outputs, consts):
+    key = (name, consts)
+    kern = _nv_kernels.get(key)
+    if kern is None:
+        src = source
+        for k, v in consts:
+            src = src.replace(k, f"{float(v)!r}f")
+        kern = _nv_kernels[key] = mx.fast.metal_kernel(
+            name=f"inkling2_{name}_{len(_nv_kernels)}",
+            input_names=inputs,
+            output_names=outputs,
+            source=src,
+            header=_NVFP4_HEADER,
+        )
+    return kern
+
+
+NV_RP = int(os.environ.get("OMLX_INKLING2_NV_RP", "2"))
+NV_RO = int(os.environ.get("OMLX_INKLING2_NV_RO", "2"))
+NV_NSG = int(os.environ.get("OMLX_INKLING2_NV_NSG", "2"))
+
+
+def nvfp4_swiglu(x, proj, inds, inv_denom, gcap, ucap):
+    """Gate/up projection of the top-k experts + scale + softcapped SwiGLU.
+
+    x: [N, H] BF16; proj: ExpertProj (nvfp4, interleaved gate/up rows);
+    inds: [N, K]. Returns act [N, K, 1, I] like ``swiglu(w13(x))``.
+    """
+    n, k = inds.shape
+    hidden = x.shape[-1]
+    i = proj.weight.shape[1] // 2
+    kern = _nv_kernel(
+        "nv_w13", _NV_W13_SOURCE, ["x", "w", "s", "inds", "gscale"], ["act"],
+        (("INV_DENOM", inv_denom), ("GCAP", gcap), ("UCAP", ucap)),
+    )
+    tiles = (i + NV_NSG * NV_RP - 1) // (NV_NSG * NV_RP)
+    return kern(
+        inputs=[x.reshape(n, hidden), proj.weight, proj.scales, inds.astype(mx.uint32), proj.global_scale],
+        template=[("T", x.dtype), ("H", hidden), ("I", i), ("K", k), ("RP", NV_RP), ("NSG", NV_NSG)],
+        grid=(32 * NV_NSG, tiles, n * k),
+        threadgroup=(32 * NV_NSG, 1, 1),
+        output_shapes=[(n, k, 1, i)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def nvfp4_down_sum(act, proj, inds, weights, inv_denom, out_dtype):
+    """Down projection of the top-k experts and their weighted sum: [N, H]."""
+    n, k = inds.shape
+    i = act.shape[-1]
+    hidden = proj.weight.shape[1]
+    kern = _nv_kernel(
+        "nv_w2", _NV_W2_SOURCE, ["act", "w", "s", "inds", "weights", "gscale"], ["out"],
+        (("INV_DENOM", inv_denom),),
+    )
+    tiles = (hidden + NV_NSG * NV_RO - 1) // (NV_NSG * NV_RO)
+    return kern(
+        inputs=[act, proj.weight, proj.scales, inds.astype(mx.uint32), weights.astype(mx.float32), proj.global_scale],
+        template=[("T", act.dtype), ("OT", out_dtype), ("H", hidden), ("I", i), ("K", k), ("RO", NV_RO),
+                  ("NSG", NV_NSG), ("HAS_SCALE", True)],
+        grid=(32 * NV_NSG, tiles, n),
+        threadgroup=(32 * NV_NSG, 1, 1),
+        output_shapes=[(n, hidden)],
+        output_dtypes=[out_dtype],
+    )[0]
