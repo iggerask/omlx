@@ -1410,10 +1410,30 @@ LONG_ATTN_KEYS_PER_SPLIT = int(os.environ.get("OMLX_INKLING2_LONG_ATTN_SPLIT", "
 LONG_ATTN_NSG = int(os.environ.get("OMLX_INKLING2_LONG_ATTN_NSG", "8"))
 
 
-LONG_ATTN_MAX_QUERIES = 4
+LONG_ATTN_MAX_QUERIES = 8   # blocks over 4 queries run as two causal halves
+_LONG_ATTN_ROWS = 4
 
 
 def long_decode_attention(q, k, v, rel, sink, *, scale, left_padding=None):
+    length = q.shape[2]
+    if length > _LONG_ATTN_ROWS:
+        # More query rows spill registers: split the block. Query t of a part
+        # starting at t0 sits at key S - L + t0 + t, so each part sees the keys
+        # up to its own last query (later keys are causally masked anyway).
+        s = k.shape[2]
+        outs = []
+        for t0 in range(0, length, _LONG_ATTN_ROWS):
+            t1 = min(length, t0 + _LONG_ATTN_ROWS)
+            end = s - length + t1
+            outs.append(_long_attention_block(
+                q[:, :, t0:t1], k[:, :, :end], v[:, :, :end], rel[:, t0:t1], sink[:, t0:t1],
+                scale=scale, left_padding=left_padding,
+            ))
+        return mx.concatenate(outs, axis=2)
+    return _long_attention_block(q, k, v, rel, sink, scale=scale, left_padding=left_padding)
+
+
+def _long_attention_block(q, k, v, rel, sink, *, scale, left_padding=None):
     """Full-attention decode/verify for one row: q [1, Hq, L, D], L <= 8.
 
     ``left_padding`` ([1] array, optional) skips the row's padded key columns
