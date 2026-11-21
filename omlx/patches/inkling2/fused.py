@@ -750,3 +750,76 @@ def small_attention(q, k, v, rel, sink, *, scale, window, left_padding=None, row
         output_shapes=[(b, hq, length, d)],
         output_dtypes=[q.dtype],
     )[0]
+
+
+# Long inputs (prefill): keep the FP32 matmuls of the reference and fuse the
+# elementwise work around them. Prep: unit RMS of x and message rows, BF16
+# rounding, laid out [N, 2, rows, H] like the reference stack. Post: gates ->
+# (1 - tanh(forget)) * x + tanh(gain) * message.
+_MSG_PREP_SOURCE = """
+    const uint row = threadgroup_position_in_grid.x;   // over N * 2 * ROWS
+    const uint tid = thread_position_in_threadgroup.x;
+    const int n = row / (2 * ROWS);
+    const int part = (row / ROWS) % 2;
+    const int r = row % ROWS;
+    const device float* src = (part == 0 ? x : msg) + ((size_t)n * ROWS + r) * H;
+    threadgroup float red[NT / 32];
+    float ss = 0.0f;
+    for (int i = tid; i < H; i += NT) { const float a = src[i]; ss += a * a; }
+    ss = simd_sum(ss);
+    if (tid % 32 == 0) red[tid / 32] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < NT / 32; ++i) tot += red[i];
+    const float f = metal::precise::rsqrt(tot / float(H) + 1e-6f);
+    device float* dst = z + (size_t)row * H;
+    for (int i = tid; i < H; i += NT) dst[i] = float(bfloat16_t(src[i] * f));
+"""
+_MSG_POST_SOURCE = """
+    const uint h = thread_position_in_grid.x;
+    const uint nr = thread_position_in_grid.y;
+    if ((int)h >= H) return;
+    const size_t g = (size_t)nr * 2 * H;
+    const float gain = metal::precise::tanh(gates[g + h]);
+    const float forget = metal::precise::tanh(gates[g + H + h]);
+    const size_t i = (size_t)nr * H + h;
+    out[i] = (1.0f - forget) * x[i] + gain * msg[i];
+"""
+
+
+def mix_messages_long(x, message, down, gain_forget):
+    """``model._mix_messages`` for prefill-sized inputs: same FP32 matmuls,
+    fused normalization and gating."""
+    n, b, length, hidden = x.shape
+    rows = b * length
+    key = ("long", hidden)
+    kerns = _msg_kernels.get(key)
+    if kerns is None:
+        kerns = _msg_kernels[key] = (
+            mx.fast.metal_kernel(name="inkling2_msg_prep", input_names=["x", "msg"],
+                                 output_names=["z"], source=_MSG_PREP_SOURCE),
+            mx.fast.metal_kernel(name="inkling2_msg_post", input_names=["gates", "x", "msg"],
+                                 output_names=["out"], source=_MSG_POST_SOURCE),
+        )
+    x = x.astype(mx.float32)
+    message = message.astype(mx.float32)
+    nt = 256
+    z = kerns[0](
+        inputs=[x, message],
+        template=[("H", hidden), ("ROWS", rows), ("NT", nt)],
+        grid=(nt * n * 2 * rows, 1, 1),
+        threadgroup=(nt, 1, 1),
+        output_shapes=[(2 * n, rows, hidden)],
+        output_dtypes=[mx.float32],
+    )[0]
+    low = (z @ down.reshape(2 * n, hidden, -1)).reshape(n, 2, rows, -1).sum(axis=1)
+    low = low.astype(mx.bfloat16).astype(mx.float32)
+    gates = low @ gain_forget
+    return kerns[1](
+        inputs=[gates, x, message],
+        template=[("H", hidden)],
+        grid=(hidden, n * rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
+    )[0]

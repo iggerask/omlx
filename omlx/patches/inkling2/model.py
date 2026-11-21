@@ -357,6 +357,8 @@ class AttnResQuery(nn.Module):
 def _mix_messages(x, message, down, gain_forget):
     if x.shape[1] * x.shape[2] <= fused.MAX_TOKENS and fused.enabled("msg"):
         return fused.mix_messages(x, message, down, gain_forget)
+    if fused.enabled("msglong"):
+        return fused.mix_messages_long(x, message, down, gain_forget)
     return _mix_messages_ref(x, message, down, gain_forget)
 
 
@@ -483,6 +485,24 @@ class Inkling2Attention(nn.Module):
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
 
+    def _row_projections(self):
+        """Row subsets of ``in_proj``: (q|r|gate|sink, k, v), built once."""
+        cached = self.__dict__.get("_rows_cache")
+        if cached is not None:
+            return cached
+        c = [0] + self._cuts + [self.in_proj.weight.shape[0]]
+        q_rows = list(range(c[0], c[1])) + list(range(c[3], c[6]))
+        parts = (
+            mx.array(q_rows, dtype=mx.int32),
+            mx.arange(c[1], c[2], dtype=mx.int32),
+            mx.arange(c[2], c[3], dtype=mx.int32),
+        )
+        cached = tuple(_select_rows(self.in_proj, rows) for rows in parts)
+        dq, dr = c[1] - c[0], c[4] - c[3]
+        self._qrgs_cuts = [dq, dq + dr, dq + dr + (c[5] - c[4])]
+        self.__dict__["_rows_cache"] = cached
+        return cached
+
     def log_tau(self, kv, length: int):
         """Query/relative-state log scaling for long positions (full layers)."""
         if self.log_floor is None:
@@ -508,6 +528,13 @@ class Inkling2Attention(nn.Module):
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+            elif length > fused.MAX_TOKENS and fused.enabled("rows"):
+                # Prefill: each looped input only needs its own rows of the
+                # fused projection (q|r|gate|sink, k, v), a third of the work.
+                qrgs, kp, vp = self._row_projections()
+                q, r, gate, sink = mx.split(qrgs(xq), self._qrgs_cuts, axis=-1)
+                k = kp(xk)
+                v = vp(xv)
             else:
                 # Looped passes give q, k and v their own inputs; one stacked
                 # projection serves all three.
@@ -626,6 +653,26 @@ class Inkling2Attention(nn.Module):
             gate.dtype
         )
         return self.o_proj(out)
+
+
+def _select_rows(layer, rows):
+    """A linear layer computing only output ``rows`` of ``layer``."""
+    if isinstance(layer, nn.QuantizedLinear):
+        out = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+        nn.Module.__init__(out)
+        out.group_size, out.bits = layer.group_size, layer.bits
+        out.mode = getattr(layer, "mode", "affine")
+        out.weight = layer.weight[rows]
+        out.scales = layer.scales[rows]
+        if layer.get("biases") is not None:
+            out.biases = layer.biases[rows]
+    else:
+        out = nn.Linear.__new__(nn.Linear)
+        nn.Module.__init__(out)
+        out.weight = layer.weight[rows]
+    out.freeze()
+    mx.eval(out.parameters())
+    return out
 
 
 def _cumsum(xs):
